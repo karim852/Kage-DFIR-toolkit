@@ -1,0 +1,16 @@
+{
+  "workspace": "",
+  "case_name": "INC-2026-0001",
+  "analyst": "",
+  "demo_mode": false,
+  "logs_source": "collector",
+  "cylr_args": "-v",
+  "yara_path": "",
+  "thor_args": "--nocsv",
+  "thor_timeout_min": 0,
+  "ai_provider": "anthropic",
+  "ai_base_url": "",
+  "ai_model": "",
+  "ai_max_chars": 0,
+  "enrich_limit": 0
+}

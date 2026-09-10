@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kage — DFIR Toolkit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="bar__id">
+    <span class="bar__mark" aria-hidden="true"></span>
+    <div>
+      <p class="bar__brand">KAGE<span>DFIR Toolkit · triage console</span></p>
+      <h1 id="caseName">CASE-001</h1>
+      <p class="bar__sub"><span id="hostLabel">host not identified</span> · <span id="wsLabel">—</span></p>
+    </div>
+  </div>
+
+  <div class="bar__status">
+    <span class="dot" id="linkDot"></span>
+    <span id="linkLabel">connecting…</span>
+    <span class="bar__sep">/</span>
+    <span id="modeLabel">—</span>
+    <span class="bar__sep">/</span>
+    <span id="clockLabel">00:00</span>
+  </div>
+
+  <div class="bar__actions">
+    <button class="btn btn--primary" id="btnRun">Run the chain</button>
+    <button class="btn" id="btnStop" disabled>Stop</button>
+    <button class="btn" id="btnReset">Reset</button>
+    <button class="btn" id="btnSettings" aria-expanded="false">Settings</button>
+  </div>
+</header>
+
+<nav class="nav" id="nav" aria-label="Views">
+  <a class="nav__item" href="/" data-route="/">Overview</a>
+  <a class="nav__item" href="/alerts" data-route="/alerts">Alerts<span class="nav__n" id="nAlerts">0</span></a>
+  <a class="nav__item" href="/indicators" data-route="/indicators">Indicators<span class="nav__n" id="nIocs">0</span></a>
+  <a class="nav__item" href="/system" data-route="/system">System<span class="nav__n" id="nSystem">0</span></a>
+  <a class="nav__item" href="/yara" data-route="/yara">YARA<span class="nav__n" id="nYara">0</span></a>
+  <a class="nav__item" href="/attack" data-route="/attack">ATT&amp;CK</a>
+  <a class="nav__item" href="/summary" data-route="/summary">Summary</a>
+  <a class="nav__item" href="/log" data-route="/log">Log</a>
+</nav>
+
+<section class="drawer" id="drawer" hidden>
+  <div class="drawer__grid">
+    <label>Workspace folder <span class="opt">empty = wherever this was launched from</span>
+      <input id="setWorkspace" type="text" spellcheck="false" placeholder="tracks the launch folder">
+    </label>
+    <label>Case reference
+      <input id="setCase" type="text" placeholder="CASE-001">
+    </label>
+    <label>Analyst
+      <input id="setAnalyst" type="text" placeholder="Responder name">
+    </label>
+    <label>VirusTotal key <span class="keyhint" id="hintVT"></span>
+      <input id="setVT" type="password" autocomplete="off" placeholder="not configured">
+    </label>
+    <label>AbuseIPDB key <span class="keyhint" id="hintAbuse"></span>
+      <input id="setAbuse" type="password" autocomplete="off" placeholder="not configured">
+    </label>
+    <label>Summary provider
+      <select id="setProvider"></select>
+    </label>
+    <label>Provider key <span class="keyhint" id="hintAI"></span>
+      <input id="setAI" type="password" autocomplete="off" placeholder="not configured">
+    </label>
+    <label>Base URL <span class="opt" id="baseUrlHint">filled in automatically</span>
+      <input id="setBaseUrl" type="text" spellcheck="false">
+    </label>
+    <label>Summary model
+      <input id="setModel" type="text">
+    </label>
+    <label>Log source
+      <select id="setLogsSource">
+        <option value="collector">Collection (CyLR)</option>
+        <option value="live">Logs in place (winevt\Logs)</option>
+        <option value="custom">Custom folder</option>
+      </select>
+    </label>
+    <label>Log folder <span class="opt">when custom</span>
+      <input id="setLogsPath" type="text" spellcheck="false" placeholder="D:\collection\Logs">
+    </label>
+    <label>CyLR arguments <span class="opt">--force-native if raw NTFS fails</span>
+      <input id="setCylrArgs" type="text" spellcheck="false" placeholder="-v">
+    </label>
+    <label>YARA scan folder <span class="opt">empty = collected artefacts</span>
+      <input id="setYaraPath" type="text" spellcheck="false" placeholder="C:\ or C:\Users\target">
+    </label>
+    <label>THOR Lite arguments
+      <input id="setThorArgs" type="text" spellcheck="false" placeholder="--quick --nocsv">
+    </label>
+    <label>THOR time limit <span class="opt">minutes — 0 = unlimited</span>
+      <input id="setThorTimeout" type="number" min="0" max="1440" step="5">
+    </label>
+    <label>Indicators to check <span class="opt">0 = all of them</span>
+      <input id="setLimit" type="number" min="0" max="5000" step="5">
+    </label>
+    <label class="drawer__check">
+      <input id="setDemo" type="checkbox">
+      <span>Demonstration mode — generates fake artefacts instead of running the collection</span>
+    </label>
+  </div>
+  <div class="drawer__foot">
+    <p class="drawer__note">Keys can be set once and for all in <code id="keyfilePath">apikeys.env</code> <span id="keyfileState"></span> — no need to retype them. They are never sent back to the browser.</p>
+    <button class="btn btn--primary" id="btnSaveSettings">Save</button>
+  </div>
+</section>
+
+<main class="shell">
+
+  <aside class="chain" aria-label="Chain of custody">
+    <h2 class="eyebrow">Chain of custody</h2>
+    <ol class="chain__list" id="chainList"></ol>
+    <p class="chain__note">Tick a step to include it in the next run. Double-click a tag to replay that step alone.</p>
+  </aside>
+
+  <section class="work" id="work">
+
+    <div class="verdict" id="verdict">
+      <div class="verdict__score">
+        <svg viewBox="0 0 120 120" class="gauge" aria-hidden="true">
+          <circle class="gauge__track" cx="60" cy="60" r="52"></circle>
+          <circle class="gauge__value" id="gaugeArc" cx="60" cy="60" r="52"></circle>
+        </svg>
+        <div class="verdict__num"><span id="scoreValue">—</span><small>/100</small></div>
+      </div>
+      <div class="verdict__body">
+        <p class="eyebrow">Triage conclusion</p>
+        <p class="verdict__line" id="verdictLine">Waiting for a collection.</p>
+        <div class="tallies" id="tallies"></div>
+        <div class="scoredetail" id="scoreDetail"></div>
+      </div>
+      <div class="verdict__window">
+        <p class="eyebrow">Window observed</p>
+        <p class="mono" id="windowLine">—</p>
+        <svg class="spark" id="spark" viewBox="0 0 300 44" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="verdict__export">
+          <a class="btn btn--ghost" id="btnHtml" href="/api/report.html" target="_blank" rel="noopener">Report</a>
+          <a class="btn btn--ghost" id="btnJson" href="/api/report.json">JSON</a>
+          <a class="btn btn--ghost" id="btnLog" href="/api/console.log">Log</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="view" data-view="/">
+      <div class="split">
+        <section class="panel panel--console">
+          <header class="panel__head">
+            <h2 class="eyebrow">Execution log</h2>
+            <div class="panel__tools">
+              <label class="mini"><input type="checkbox" id="onlyImportant"> hide noise</label>
+              <label class="mini"><input type="checkbox" id="autoScroll" checked> follow</label>
+            </div>
+          </header>
+          <div class="console" id="console" role="log" aria-live="polite"></div>
+        </section>
+
+        <section class="panel">
+          <header class="panel__head"><h2 class="eyebrow">Alert breakdown</h2></header>
+          <div class="pane" id="overview"></div>
+        </section>
+      </div>
+    </div>
+
+    <div class="view" data-view="/alerts" hidden>
+      <section class="panel">
+        <header class="panel__head">
+          <h2 class="eyebrow">Timeline alerts</h2>
+          <span class="panel__count" id="alertCount">—</span>
+        </header>
+        <div class="filters">
+          <input type="search" id="alertSearch" placeholder="Filter on rule or detail…" spellcheck="false">
+          <div class="chips" id="levelChips"></div>
+        </div>
+        <div class="filters filters--cat">
+          <span class="filters__label">Families</span>
+          <div class="chips" id="catChips"></div>
+        </div>
+        <div class="tablewrap"><table class="grid" id="alertTable">
+          <thead><tr><th>Timestamp</th><th>Level</th><th>Family</th><th>Rule</th><th>ID</th><th>Detail</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <p class="empty" id="alertEmpty">No alert: the timeline has not been analysed yet.</p>
+      </section>
+    </div>
+
+    <div class="view" data-view="/indicators" hidden>
+      <section class="panel">
+        <header class="panel__head">
+          <h2 class="eyebrow">Extracted indicators</h2>
+          <span class="panel__count" id="iocCount">—</span>
+        </header>
+        <div class="tablewrap"><table class="grid" id="iocTable">
+          <thead><tr><th>Type</th><th>Value</th><th>Hits</th><th>Verdict</th><th>Reputation</th><th>Seen in</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <p class="empty" id="iocEmpty">No indicator extracted yet.</p>
+      </section>
+    </div>
+
+    <div class="view" data-view="/system" hidden>
+      <div class="sysgrid" id="sysgrid"></div>
+      <p class="empty" id="sysEmpty">Run the "Capture the system context" step to populate this view.</p>
+    </div>
+
+    <div class="view" data-view="/yara" hidden>
+      <section class="panel">
+        <header class="panel__head">
+          <h2 class="eyebrow">YARA verdicts</h2>
+          <span class="panel__count" id="yaraCount">—</span>
+        </header>
+        <div class="filters">
+          <input type="search" id="yaraSearch" placeholder="Filter on file, rule or hash…" spellcheck="false">
+          <div class="chips" id="yaraChips"></div>
+        </div>
+        <div class="tablewrap"><table class="grid" id="yaraTable">
+          <thead><tr><th>Verdict</th><th>Detection</th><th>File</th><th>Module</th><th>Hash</th><th>Score</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <p class="empty" id="yaraEmpty">Verdicts appear here during the scan.</p>
+      </section>
+    </div>
+
+    <div class="view" data-view="/attack" hidden>
+      <section class="panel">
+        <header class="panel__head"><h2 class="eyebrow">Observed tactics</h2></header>
+        <div id="attack" class="attack"></div>
+        <p class="empty" id="attackEmpty">Tactics appear once the timeline is analysed.</p>
+      </section>
+    </div>
+
+    <div class="view" data-view="/summary" hidden>
+      <section class="panel">
+        <header class="panel__head"><h2 class="eyebrow">Summary</h2></header>
+        <div id="aiReport" class="report"></div>
+        <p class="empty" id="aiEmpty">The summary is written at the last step of the chain.</p>
+      </section>
+    </div>
+
+    <div class="view" data-view="/log" hidden>
+      <section class="panel panel--tall">
+        <header class="panel__head">
+          <h2 class="eyebrow">Full log</h2>
+          <div class="panel__tools">
+            <label class="mini"><input type="checkbox" id="onlyImportant2"> hide noise</label>
+            <a class="btn btn--ghost" href="/api/console.log">Download</a>
+          </div>
+        </header>
+        <div class="console console--tall" id="console2" role="log"></div>
+      </section>
+    </div>
+
+  </section>
+</main>
+
+<div class="reader" id="reader" hidden role="dialog" aria-modal="true" aria-label="Detailed analysis">
+  <div class="reader__box">
+    <header class="reader__head">
+      <div>
+        <p class="eyebrow" id="readerKind">Alert</p>
+        <h2 id="readerTitle">—</h2>
+      </div>
+      <div class="reader__nav">
+        <span class="reader__pos mono" id="readerPos">—</span>
+        <button class="btn" id="readerPrev" title="Previous (←)">←</button>
+        <button class="btn" id="readerNext" title="Next (→)">→</button>
+        <button class="btn" id="readerCopy">Copy</button>
+        <button class="btn" id="readerClose" title="Close (Esc)">Close</button>
+      </div>
+    </header>
+    <div class="reader__body" id="readerBody"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
