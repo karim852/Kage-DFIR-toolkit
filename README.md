@@ -11,15 +11,7 @@
 <img src="https://img.shields.io/badge/Linux-in_progress-f59e0b?style=flat-square">
 <img src="https://img.shields.io/badge/License-MIT-6b7280?style=flat-square">
 </p>
-
-<p align="center"><b>One host. One chain. A report you can defend.</b></p>
-
 ---
-
-*Kage* (影) is the trace a thing leaves rather than the thing itself. That is the
-job: separate an intrusion's trace from the noise the triage generates itself,
-from routine administration, and from everything benign — then show the work
-behind the verdict.
 
 Point Kage at a suspect Windows host and it runs the whole triage in one chain:
 **CyLR** collects the artefacts, **Hayabusa** correlates the event logs against
