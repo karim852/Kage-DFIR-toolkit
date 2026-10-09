@@ -11,6 +11,7 @@
 <img src="https://img.shields.io/badge/Linux-in_progress-f59e0b?style=flat-square">
 <img src="https://img.shields.io/badge/License-MIT-6b7280?style=flat-square">
 <a href="https://ko-fi.com/k0r1m"><img src="https://img.shields.io/badge/Ko--fi-Support-FF5E5B?style=flat-square&logo=kofi&logoColor=white"></a>
+<a href="https://youtu.be/PVJ-QQXbdfI"><img src="https://img.shields.io/badge/Demo-Watch_on_YouTube-FF0000?style=flat-square&logo=youtube&logoColor=white"></a>
 </p>
 ---
 
