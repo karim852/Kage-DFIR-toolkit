@@ -27,6 +27,7 @@ python -m dfirconsole          # → http://127.0.0.1:8787
 
 <p align="center">
   <img src="docs/overview.jpg" alt="Kage overview" width="100%">
+  <img src="kage-dashboard.gif" alt="Kage overview" width="100%">
   <br><sub>The overview: eleven sealed steps on the left, the execution log
   streaming, and the score broken into its four components.</sub>
 </p>
