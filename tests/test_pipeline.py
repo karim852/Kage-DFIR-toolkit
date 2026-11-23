@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfirconsole import ai, timeline  # noqa: E402
+from dfirconsole import ai, sysinfo, timeline  # noqa: E402
 from collections import Counter
 
 from dfirconsole.bus import EventBus  # noqa: E402
@@ -211,6 +211,7 @@ def test_http_api(tmp_path: Path, monkeypatch) -> None:
 
     server.settings.workspace = str(tmp_path / "dfir")
     server.settings.demo_mode = True
+    server._attach_logfile()     # or the session log lands in the repo's output/
     server.case.reset()
 
     with TestClient(server.app) as client:
@@ -256,6 +257,7 @@ def test_websocket_stream(tmp_path: Path, monkeypatch) -> None:
 
     server.settings.workspace = str(tmp_path / "dfir2")
     server.settings.demo_mode = True
+    server._attach_logfile()
     server.case.reset()
 
     with TestClient(server.app) as client:
@@ -597,7 +599,7 @@ def test_active_connections_become_iocs(workspace: Settings) -> None:
 
     values = {i["value"] for i in case.report["iocs"]}
     assert "185.220.101.34" in values
-    from_network = [i for i in case.report["iocs"] if i.get("source") == "connexion active"]
+    from_network = [i for i in case.report["iocs"] if i.get("source") == "active connection"]
     assert from_network, "no address came from the active connections"
     # Internal peers stay out.
     assert "10.20.4.19" not in values
@@ -801,8 +803,14 @@ def test_no_phantom_methods_in_pipeline() -> None:
               if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
               and n.value.id == "self"}
 
-    # Data attributes assigned on self, which are not method calls.
-    data_attributes = {"_task"}
+    # Anything assigned with `self.x = ...` is data, not a method.
+    data_attributes = {
+        target.attr
+        for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    }
     missing = {m for m in called
                if m.startswith("_") and not m.startswith("__")
                and m not in defined and m not in data_attributes}
@@ -835,8 +843,20 @@ def test_timeline_command_is_unchanged(workspace: Settings) -> None:
 
     source = inspect.getsource(Case.step_timeline)
     for fragment in ('"-d", str(logs)', '"-o", str(settings.timeline_csv)',
-                     '"--no-wizard", "--RFC-3339", "--UTC"', '"-r", str(rules)'):
+                     '"--no-wizard", "--rfc-3339", "--utc"', '"-r", str(rules)',
+                     '"--profile", "verbose"'):
         assert fragment in source, f"missing from the command: {fragment}"
+
+
+def test_flags_are_matched_whatever_their_case() -> None:
+    """Hayabusa 3+ writes --rfc-3339 and --utc in lower case; the old exact
+    match on "--RFC-3339"/"--UTC" dropped both and left local timestamps."""
+    help_v4 = "  --rfc-3339   Output timestamp in RFC 3339 format\n  -U, --utc   Output time in UTC\n"
+    help_v2 = "      --RFC-3339   Output timestamp in RFC 3339 format\n      --UTC   UTC\n"
+    assert Case._spelling("--utc", help_v4) == "--utc"
+    assert Case._spelling("--rfc-3339", help_v2) == "--RFC-3339"
+    assert Case._spelling("--utc", "-U, --utc-offset") is None
+    assert Case._spelling("--no-wizard", "") == "--no-wizard"
 
 
 # --- risk model -----------------------------------------------------------
@@ -846,10 +866,12 @@ def test_score_components_are_capped_and_sum_to_total() -> None:
     # A single rule firing 3000 times must not reach the same verdict as a
     # genuine multi-stage intrusion.
     report.levels = Counter({"medium": 3000})
+    report.alert_rules["medium"] = {"One noisy rule"}
     breakdown = report.score_breakdown()
 
     severity = next(c for c in breakdown["components"] if c["name"] == "Severity")
-    assert severity["value"] == severity["max"]
+    # Repetition is not breadth: far from the cap.
+    assert severity["value"] < severity["max"] / 2
     assert breakdown["score"] == sum(c["value"] for c in breakdown["components"])
     assert breakdown["score"] <= 100
     # Volume alone, with no corroboration, stays below "confirmed".
@@ -1185,3 +1207,94 @@ def test_no_secret_file_ships_in_the_tree() -> None:
     for name in ("apikeys.env", ".env", "config.json"):
         assert not (root / name).exists(), f"{name} must not ship"
     assert not list(root.rglob("*.lic")), "a THOR licence must not ship"
+
+
+def test_slow_client_is_resynced_not_dropped() -> None:
+    """A browser that falls behind gets a resync marker instead of silence.
+
+    It used to be unsubscribed without a word and kept showing a finished run
+    as still running."""
+    async def scenario() -> None:
+        bus = EventBus()
+        queue = bus.subscribe()
+        for n in range(queue.maxsize + 50):
+            bus.emit("log", message=f"line {n}")
+        assert queue.qsize() < queue.maxsize          # flushed, not stuck full
+        first = queue.get_nowait()
+        assert first["kind"] == "resync"
+        bus.emit("run", state="finished")
+        later = [queue.get_nowait() for _ in range(queue.qsize())]
+        assert later[-1]["kind"] == "run"             # still subscribed
+        assert bus.seq == later[-1]["seq"]
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_carries_the_event_sequence(tmp_path: Path) -> None:
+    bus = EventBus()
+    case = Case(Settings(workspace=str(tmp_path), demo_mode=True), bus)
+    bus.emit("log", message="x")
+    assert case.snapshot()["seq"] == bus.seq
+
+
+# --- calibration (see tests/score_eval.py for the evaluation on real logs) ----
+def _scored(distinct: dict, volume: dict, tactics: list[str], external: dict | None = None) -> dict:
+    report = timeline.TimelineReport()
+    report.levels = Counter(volume)
+    report.distinct_rules = distinct
+    report.tactics = Counter({t: 1 for t in tactics})
+    return report.score_breakdown(external)
+
+
+def test_score_separates_small_and_large_incidents() -> None:
+    single = _scored({"high": 2}, {"high": 6}, ["Credential Access"])["score"]
+    staged = _scored({"critical": 1, "high": 5, "medium": 3}, {"critical": 2, "high": 30, "medium": 9},
+                     ["Execution", "Persistence", "Credential Access"])["score"]
+    chain = _scored({"critical": 4, "high": 14, "medium": 8}, {"critical": 12, "high": 300, "medium": 60},
+                    ["Execution", "Persistence", "Privilege Escalation", "Defense Evasion",
+                     "Credential Access", "Lateral Movement", "Command and Control"])["score"]
+    assert single < staged < chain
+    assert single < 40 and chain >= 55
+    # Timeline evidence alone never claims the top band: that takes corroboration.
+    assert chain < 70
+
+
+def test_repetition_barely_moves_the_score() -> None:
+    once = _scored({"high": 1}, {"high": 1}, ["Execution"])["score"]
+    repeated = _scored({"high": 1}, {"high": 500}, ["Execution"])["score"]
+    assert repeated - once <= 10
+
+
+def test_corroboration_lifts_a_full_chain_to_the_top_band() -> None:
+    tactics = ["Execution", "Persistence", "Defense Evasion", "Credential Access",
+               "Lateral Movement", "Command and Control"]
+    base = _scored({"critical": 4, "high": 12}, {"critical": 10, "high": 200}, tactics)
+    corroborated = _scored({"critical": 4, "high": 12}, {"critical": 10, "high": 200}, tactics,
+                           {"yara_alerts": 2, "live_connections": 1, "malicious": 1})
+    assert corroborated["score"] >= 70 > base["score"]
+
+
+def test_only_suspicious_connections_corroborate() -> None:
+    connections = [
+        {"state": "ESTABLISHED", "remote_ip": "142.250.75.238", "risk": "normal"},
+        {"state": "ESTABLISHED", "remote_ip": "45.155.205.233", "risk": "high"},
+        {"state": "ESTABLISHED", "remote_ip": "10.20.4.19", "risk": "high"},
+        {"state": "LISTENING", "remote_ip": "0.0.0.0", "risk": "high"},
+    ]
+    assert sysinfo.suspicious_peers(connections) == ["45.155.205.233"]
+
+
+def test_mitre_column_drives_the_kill_chain(tmp_path: Path) -> None:
+    """Hayabusa's verbose profile carries each rule's tactics; informational
+    events, however their text reads, add none."""
+    csv_path = tmp_path / "verbose.csv"
+    csv_path.write_text(
+        '"Timestamp","RuleTitle","Level","Computer","Channel","EventID","MitreTactics","Details","EvtxFile"\n'
+        '"2026-01-01 10:00:00.000 +00:00","Proc Exec","info","PC1","Sec","4688","","Cmdline: cmd.exe /c whoami","a.evtx"\n'
+        '"2026-01-01 10:01:00.000 +00:00","Hidden Run Key","high","PC1","Sysmon","13","Persis ¦ Stealth","x","a.evtx"\n'
+        '"2026-01-01 10:02:00.000 +00:00","Hidden Run Key","high","PC1","Sysmon","13","Persis ¦ Stealth","y","a.evtx"\n'
+        '"2026-01-01 10:03:00.000 +00:00","LSASS Access","crit","PC1","Sysmon","10","CredAccess","z","a.evtx"\n',
+        encoding="utf-8")
+    report = timeline.analyse_csv(csv_path).to_dict()
+    assert dict(report["tactics"]) == {"Persistence": 2, "Defense Evasion": 2, "Credential Access": 1}
+    assert report["distinct_rules"] == {"critical": 1, "high": 1, "medium": 0}

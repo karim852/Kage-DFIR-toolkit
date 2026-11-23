@@ -15,6 +15,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+import struct
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -94,12 +95,26 @@ def _ps_date(value) -> str:
     return str(value)[:32]
 
 
+def _sid_text(value) -> str:
+    """Windows PowerShell serialises a SID as an object ({"Value": "S-1-5-…",
+    "BinaryLength": 28, …}), PowerShell 7 sometimes as a plain string. Read as
+    a string, the object hid the RID, so the built-in administrator (RID 500)
+    was never recognised on a real host."""
+    if isinstance(value, dict):
+        value = value.get("Value") or ""
+    return str(value or "")
+
+
 def parse_users(users_json: str, admins_json: str = "") -> list[dict]:
     """Local accounts, with Administrators group membership."""
     admins = set()
+    # Compared in lower case, shown as Windows spells them ("Domain Admins",
+    # not "domain admins", the way the disk-image path already names it).
+    spelled: dict[str, str] = {}
     for entry in parse_powershell_json(admins_json):
-        name = str(entry.get("Name") or entry.get("name") or "")
-        admins.add(name.split("\\")[-1].lower())
+        name = str(entry.get("Name") or entry.get("name") or "").split("\\")[-1]
+        admins.add(name.lower())
+        spelled.setdefault(name.lower(), name)
 
     accounts: list[dict] = []
     for entry in parse_powershell_json(users_json):
@@ -113,7 +128,7 @@ def parse_users(users_json: str, admins_json: str = "") -> list[dict]:
             "admin": name.lower() in admins,
             "last_logon": _ps_date(entry.get("LastLogon")),
             "created": _ps_date(entry.get("PasswordLastSet") or entry.get("Created")),
-            "sid": str(entry.get("SID") or entry.get("Sid") or ""),
+            "sid": _sid_text(entry.get("SID") or entry.get("Sid")),
             "description": str(entry.get("Description") or "")[:120],
             "flags": [],
         }
@@ -134,7 +149,7 @@ def parse_users(users_json: str, admins_json: str = "") -> list[dict]:
     known = {a["name"].lower() for a in accounts}
     for admin in sorted(admins - known):
         accounts.append({
-            "name": admin, "enabled": None, "admin": True, "last_logon": "",
+            "name": spelled.get(admin, admin), "enabled": None, "admin": True, "last_logon": "",
             "created": "", "sid": "", "description": "",
             "flags": ["non-local administrator (domain)"],
         })
@@ -243,6 +258,13 @@ def parse_netstat(text: str, processes: dict[int, str] | None = None) -> list[di
     return connections
 
 
+def suspicious_peers(connections: list[dict]) -> list[str]:
+    """Public hosts this machine talks to over a connection flagged as risky."""
+    return sorted({c["remote_ip"] for c in connections
+                   if c.get("state") == "ESTABLISHED" and is_public_ip(c.get("remote_ip", ""))
+                   and c.get("risk") in ("high", "medium")})
+
+
 def network_summary(connections: list[dict]) -> dict:
     listening = [c for c in connections if c["state"] in ("LISTENING", "LISTEN")]
     established = [c for c in connections if c["state"] == "ESTABLISHED"]
@@ -259,26 +281,30 @@ def network_summary(connections: list[dict]) -> dict:
 # =========================================================================
 # Disk root
 # =========================================================================
-def analyse_root(root: Path, recent_days: int = 30) -> list[dict]:
-    """Spot what has no business at the root of the system drive."""
+def analyse_root_entries(listing: list[dict], reference: float | None = None,
+                         prefix: str = "C:\\", recent_days: int = 30) -> list[dict]:
+    """Flag what has no business at the root of the system drive.
+
+    `listing` holds {name, is_dir, created} entries, whether they come from a
+    live `iterdir()` or from a disk image. `reference` is the moment ages are
+    measured against: now on a live host, the last log write on an image —
+    "created 2 days ago" means nothing about a disk acquired last year.
+    """
     entries: list[dict] = []
-    if not root.exists():
-        return entries
+    now = reference or datetime.now(timezone.utc).timestamp()
 
-    now = datetime.now(timezone.utc).timestamp()
-    try:
-        children = list(root.iterdir())
-    except (OSError, PermissionError):
-        return entries
-
-    for child in children:
-        name = child.name
+    for item in listing:
+        name = item["name"]
         lowered = name.lower()
-        try:
-            stat = child.stat()
-            created = datetime.fromtimestamp(stat.st_ctime, timezone.utc).isoformat()
-            age_days = (now - stat.st_ctime) / 86400
-        except (OSError, PermissionError):
+        # NTFS metadata files ($MFT, $Bitmap…) only show up when reading the
+        # volume raw; Explorer never lists them and they are not anomalies.
+        if lowered.startswith("$") and lowered not in STANDARD_ROOT:
+            continue
+        born = item.get("created")
+        if born and born > 0:
+            created = datetime.fromtimestamp(born, timezone.utc).isoformat()
+            age_days = max(0.0, (now - born) / 86400)
+        else:
             created, age_days = "", 9999
 
         flags: list[str] = []
@@ -297,7 +323,8 @@ def analyse_root(root: Path, recent_days: int = 30) -> list[dict]:
             flags.append("hidden name or stray whitespace")
             risk = "high"
         if age_days < recent_days and lowered not in STANDARD_ROOT:
-            flags.append(f"created {age_days:.0f} day(s) ago")
+            when = "ago" if reference is None else "before the last log write"
+            flags.append(f"created {age_days:.0f} day(s) {when}")
             risk = "high"
 
         if not flags:
@@ -305,8 +332,8 @@ def analyse_root(root: Path, recent_days: int = 30) -> list[dict]:
 
         entries.append({
             "name": name,
-            "path": str(child),
-            "kind": "folder" if child.is_dir() else "file",
+            "path": prefix + name,
+            "kind": "folder" if item.get("is_dir") else "file",
             "created": created,
             "age_days": round(age_days, 1) if age_days < 9999 else None,
             "flags": flags,
@@ -316,6 +343,28 @@ def analyse_root(root: Path, recent_days: int = 30) -> list[dict]:
     order = {"high": 0, "medium": 1, "normal": 2}
     entries.sort(key=lambda e: (order[e["risk"]], e["name"].lower()))
     return entries
+
+
+def analyse_root(root: Path, recent_days: int = 30) -> list[dict]:
+    """Live variant: list the drive root, then apply the same rules."""
+    if not root.exists():
+        return []
+    try:
+        children = list(root.iterdir())
+    except (OSError, PermissionError):
+        return []
+
+    listing = []
+    for child in children:
+        try:
+            born = child.stat().st_ctime
+            is_dir = child.is_dir()
+        except (OSError, PermissionError):
+            born, is_dir = None, False
+        listing.append({"name": child.name, "is_dir": is_dir, "created": born})
+
+    prefix = str(root) if str(root).endswith(("\\", "/")) else str(root) + "\\"
+    return analyse_root_entries(listing, prefix=prefix, recent_days=recent_days)
 
 
 # =========================================================================
@@ -332,6 +381,38 @@ SYSTEMINFO_FIELDS = {
     "logon_server": ("Serveur d'ouverture de session", "Logon Server"),
     "hostname": ("Nom de l'hôte", "Host Name"),
 }
+
+
+OSINFO_SCRIPT = (
+    "# KAGE-OSINFO\n"
+    "$os = Get-CimInstance Win32_OperatingSystem; "
+    "$cv = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'; "
+    "[pscustomobject]@{install=([DateTimeOffset]$os.InstallDate).ToUnixTimeSeconds();"
+    "boot=([DateTimeOffset]$os.LastBootUpTime).ToUnixTimeSeconds();"
+    "build=$os.Version; release=$cv.DisplayVersion; timezone=(Get-TimeZone).StandardName}"
+    " | ConvertTo-Json -Compress"
+)
+
+
+def parse_osinfo(text: str) -> dict:
+    """UTC instants and release name from OSINFO_SCRIPT; empty when the query
+    failed, so the systeminfo values stay as they were."""
+    entries = parse_powershell_json(text)
+    if not entries:
+        return {}
+    entry = entries[0]
+    values: dict[str, str] = {}
+    for field, key in (("install_date", "install"), ("boot_time", "boot")):
+        try:
+            values[field] = datetime.fromtimestamp(int(entry.get(key)), timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            pass
+    build, release = str(entry.get("build") or ""), str(entry.get("release") or "")
+    if build:
+        values["os_version"] = f"{build} ({release})" if release else build
+    if entry.get("timezone"):
+        values["timezone"] = str(entry["timezone"])
+    return values
 
 
 def parse_systeminfo(text: str) -> dict:
@@ -362,6 +443,14 @@ def system_findings(context: dict) -> list[dict]:
     findings: list[dict] = []
 
     for account in context.get("users", []):
+        if "non-local administrator (domain)" in (account.get("flags") or []):
+            findings.append({
+                "level": "medium",
+                "title": f"Domain principal in local Administrators: {account['name']}",
+                "detail": "every member of this domain principal is an administrator "
+                          "of this host",
+            })
+            continue
         if account.get("admin") and account.get("enabled") is not False:
             findings.append({
                 "level": "medium",
@@ -482,6 +571,35 @@ def parse_channels(json_text: str) -> dict[str, dict]:
     return channels
 
 
+EVTX_CHUNK = 65536
+
+
+def evtx_record_count(path: Path) -> int | None:
+    """Count the records an EVTX file holds, from its chunk headers.
+
+    Each 64 KB chunk states the first and last record number it contains, so
+    the count is exact without parsing a single event. File size alone lies:
+    a 68 KB log can be empty or full of attack traces. None when the file is
+    not an EVTX at all.
+    """
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(4096)
+            if header[:8] != b"ElfFile\0":
+                return None
+            total = 0
+            while True:
+                chunk = handle.read(EVTX_CHUNK)
+                if len(chunk) < 0x18 or chunk[:8] != b"ElfChnk\0":
+                    break
+                first, last = struct.unpack_from("<QQ", chunk, 0x08)
+                if last >= first and first:
+                    total += last - first + 1
+            return total
+    except OSError:
+        return None
+
+
 def evtx_inventory(logs_dir: Path | None) -> dict[str, dict]:
     """What the collection actually contains, file by file."""
     inventory: dict[str, dict] = {}
@@ -492,7 +610,8 @@ def evtx_inventory(logs_dir: Path | None) -> dict[str, dict]:
             size = evtx.stat().st_size
         except OSError:
             size = 0
-        inventory[evtx.name.lower()] = {"size": size, "path": str(evtx)}
+        inventory[evtx.name.lower()] = {"size": size, "path": str(evtx),
+                                        "records": evtx_record_count(evtx)}
     return inventory
 
 
@@ -525,7 +644,8 @@ def audit_coverage(channels: dict[str, dict], inventory: dict[str, dict],
 
         live = channels.get(channel.lower())
         collected = inventory.get(filename.lower())
-        records = live["records"] if live else 0
+        records = live["records"] if live else ((collected or {}).get("records") or 0)
+        counted = live is not None or (collected or {}).get("records") is not None
         size = (live or {}).get("size") or (collected or {}).get("size") or 0
         enabled = live["enabled"] if live else None
 
@@ -533,8 +653,9 @@ def audit_coverage(channels: dict[str, dict], inventory: dict[str, dict],
             verdict, comment = "missing", "channel not found — no logging at all"
         elif enabled is False:
             verdict, comment = "disabled", "channel present but disabled"
-        elif records == 0 and size <= 69632:
-            # 68 KB is the size of an empty EVTX: present but never written to.
+        elif records == 0 and (counted or size <= 69632):
+            # Counted records decide when available; otherwise 68 KB is the
+            # size of an EVTX that was never written to.
             verdict, comment = "empty", "channel enabled but no event recorded"
         else:
             verdict = "active"

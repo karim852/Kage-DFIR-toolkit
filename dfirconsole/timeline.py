@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import ipaddress
+import math
 import re
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -27,6 +28,21 @@ _COLUMNS = {
     "record_id": ["recordid"],
     "details": ["details"],
     "extra": ["extrafieldinfo", "extrafield", "extra"],
+    # Present with Hayabusa's verbose profile: the rule's own ATT&CK tactics,
+    # and the log file each detection came from.
+    "tactics": ["mitretactics"],
+    "evtx": ["evtxfile"],
+}
+
+# Hayabusa's tactic abbreviations. ATT&CK v18 split Defense Evasion into
+# Stealth and Defense Impairment; both count as Defense Evasion here.
+MITRE_ABBREVIATIONS = {
+    "initaccess": "Initial Access", "exec": "Execution", "persis": "Persistence",
+    "privesc": "Privilege Escalation", "evas": "Defense Evasion", "stealth": "Defense Evasion",
+    "defimpair": "Defense Evasion", "credaccess": "Credential Access", "disc": "Discovery",
+    "latmov": "Lateral Movement", "collect": "Collection", "c2": "Command and Control",
+    "exfil": "Exfiltration", "impact": "Impact", "recon": "Reconnaissance",
+    "resdev": "Resource Development",
 }
 
 RE_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -217,6 +233,10 @@ class TimelineReport:
         self.channels: Counter = Counter()
         self.event_ids: Counter = Counter()
         self.tactics: Counter = Counter()
+        # Distinct rules per alert level: what the severity axis counts, so
+        # one rule firing 300 times weighs like one rule, not like 300.
+        self.alert_rules: dict[str, set] = {"critical": set(), "high": set(), "medium": set()}
+        self.distinct_rules: dict[str, int] | None = None
         self.categories: Counter = Counter()
         self.self_noise = 0
         self.findings: list[dict] = []
@@ -279,7 +299,18 @@ class TimelineReport:
                 self.last_seen = timestamp
             self.hourly[timestamp[:15]] += 1
 
-        tactics = _tactics(blob)
+        # Tactics only from alerts. The rule's own ATT&CK tags when Hayabusa
+        # gives them; otherwise keywords, which used to read "Execution" in
+        # the "Cmdline:" of every informational process event.
+        tactics: list[str] = []
+        if level in ("critical", "high", "medium"):
+            self.alert_rules[level].add(rule)
+            if "tactics" in cols:
+                tactics = sorted({MITRE_ABBREVIATIONS[t] for t in
+                                  re.split(r"\s*[¦|,]\s*", get("tactics").lower())
+                                  if t in MITRE_ABBREVIATIONS})
+            else:
+                tactics = _tactics(blob)
         for tactic in tactics:
             self.tactics[tactic] += 1
 
@@ -338,6 +369,17 @@ class TimelineReport:
     # an opaque number.
     SEVERITY_CAP, CHAIN_CAP, REPUTATION_CAP, CORROBORATION_CAP = 45, 25, 20, 10
 
+    # Calibrated on about 600 real attack recordings (tests/score_eval.py):
+    # one technique lands near 27, three near 49, a full chain of five to
+    # eight near 62-66. The old curve gave 45/45 for one critical plus one
+    # high alert and 25/25 for five tactics, so anything bigger than a single
+    # technique sat on the same 70.
+    RULE_WEIGHT = {"critical": 8, "high": 3, "medium": 1}
+    SEVERITY_SCALE = 16.0      # distinct-rule points for 63% of the axis
+    VOLUME_WEIGHT = 1.5        # repetition still counts, logarithmically,
+    VOLUME_CAP = 3.0           # and stops counting past about 20 alerts
+    CHAIN_SCALE = 4.0          # tactics (decisive ones twice) for 63% of the axis
+
     # Tactics that only matter once something else already happened. Discovery
     # alone is an administrator; discovery plus credential access is not.
     DECISIVE_TACTICS = {
@@ -345,18 +387,27 @@ class TimelineReport:
         "Exfiltration", "Impact", "Persistence", "Defense Evasion",
     }
 
+    def _distinct(self) -> dict[str, int]:
+        if self.distinct_rules is not None:
+            return self.distinct_rules
+        return {level: len(rules) for level, rules in self.alert_rules.items()}
+
     def score_breakdown(self, external: dict | None = None) -> dict:
         """Compute the risk score and show every component."""
         external = external or {}
 
-        # -- severity: log-compressed weighted volume
-        raw = sum(LEVEL_WEIGHT[level] * count for level, count in self.levels.items())
-        severity = min(self.SEVERITY_CAP, round(6.5 * (raw ** 0.5))) if raw else 0
+        # -- severity: how many different detections, plus a little volume
+        distinct = self._distinct()
+        volume = sum(self.levels.get(level, 0) for level in self.RULE_WEIGHT)
+        raw = sum(self.RULE_WEIGHT[level] * distinct.get(level, 0) for level in self.RULE_WEIGHT)
+        raw += self.VOLUME_WEIGHT * min(math.log1p(volume), self.VOLUME_CAP)
+        severity = round(self.SEVERITY_CAP * (1 - math.exp(-raw / self.SEVERITY_SCALE)))
 
-        # -- kill chain: breadth of the attack, with decisive tactics weighted
+        # -- kill chain: breadth of the attack, decisive tactics counted twice
         tactics = set(self.tactics)
         decisive = tactics & self.DECISIVE_TACTICS
-        chain = min(self.CHAIN_CAP, 3 * len(tactics) + 3 * len(decisive))
+        breadth = len(tactics) + len(decisive)
+        chain = round(self.CHAIN_CAP * (1 - math.exp(-breadth / self.CHAIN_SCALE)))
 
         # -- reputation: only externally confirmed indicators count
         malicious = external.get("malicious", 0)
@@ -371,7 +422,7 @@ class TimelineReport:
             reasons.append(f"{external['yara_alerts']} YARA detection(s)")
         if external.get("live_connections"):
             corroboration += 4
-            reasons.append(f"{external['live_connections']} active connection(s) to public hosts")
+            reasons.append(f"{external['live_connections']} suspicious connection(s) to public hosts")
         corroboration = min(self.CORROBORATION_CAP, corroboration)
 
         total = severity + chain + reputation + corroboration
@@ -381,7 +432,8 @@ class TimelineReport:
                 {"name": "Severity", "value": int(severity), "max": self.SEVERITY_CAP,
                  "detail": (f"{self.levels.get('critical', 0)} critical, "
                             f"{self.levels.get('high', 0)} high, "
-                            f"{self.levels.get('medium', 0)} medium")},
+                            f"{self.levels.get('medium', 0)} medium · "
+                            f"{sum(distinct.values())} distinct rule(s)")},
                 {"name": "Kill chain", "value": int(chain), "max": self.CHAIN_CAP,
                  "detail": (f"{len(tactics)} ATT&CK tactic(s), {len(decisive)} decisive"
                             if tactics else "no tactic inferred")},
@@ -468,6 +520,7 @@ class TimelineReport:
         return {
             "total": self.total,
             "levels": {level: self.levels.get(level, 0) for level in LEVELS},
+            "distinct_rules": self._distinct(),
             "risk_score": self.risk_score,
             "verdict": self.verdict,
             "score_breakdown": self.score_breakdown(),

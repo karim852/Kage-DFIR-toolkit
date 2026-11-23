@@ -22,7 +22,7 @@ env = {**os.environ, "DFIR_CONFIG": str(WORK / "config.json")}
 server = subprocess.Popen(
     [sys.executable, "-m", "uvicorn", "dfirconsole.server:app",
      "--host", "127.0.0.1", "--port", str(PORT), "--log-level", "warning"],
-    cwd=str(ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    cwd=str(ROOT), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,  # an unread pipe would block the server
 )
 time.sleep(3.5)
 

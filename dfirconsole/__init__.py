@@ -12,4 +12,4 @@ then show the work behind the verdict.
 APP_NAME = "KAGE"
 APP_FULL_NAME = "Kage DFIR Toolkit"
 APP_TAGLINE = "DFIR Toolkit · triage console"
-__version__ = "1.5.0"
+__version__ = "1.6.0"

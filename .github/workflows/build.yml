@@ -1,0 +1,102 @@
+name: Build executables
+
+# A tag such as v1.6.0 builds both executables, smoke-tests them and publishes
+# a GitHub release. "Run workflow" builds them without releasing, to try a
+# change before tagging it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build · ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows x64
+            binary: dist/kage.exe
+            asset: kage-windows-x64.exe
+          - os: ubuntu-latest
+            label: Linux x64
+            binary: dist/kage
+            asset: kage-linux-x64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Tests before building
+        run: python -m pytest tests/ -q
+
+      - name: Build the executable
+        run: python -m PyInstaller --noconfirm --clean kage.spec
+
+      - name: Smoke test the executable
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            python build_support/smoke_test.py "${{ matrix.binary }}" "$GITHUB_REF_NAME"
+          else
+            python build_support/smoke_test.py "${{ matrix.binary }}"
+          fi
+
+      - name: Name and fingerprint the asset
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "${{ matrix.binary }}" "release/${{ matrix.asset }}"
+          cd release
+          python -c "import hashlib,sys; p=sys.argv[1]; print(hashlib.sha256(open(p,'rb').read()).hexdigest() + '  ' + p)" "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          cat "${{ matrix.asset }}.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: release
+        run: |
+          cat ./*.sha256 > SHA256SUMS.txt
+          rm ./*.sha256
+          cat SHA256SUMS.txt
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --title "Kage DFIR Toolkit $GITHUB_REF_NAME" \
+            --notes-file build_support/release-notes.md \
+            --verify-tag

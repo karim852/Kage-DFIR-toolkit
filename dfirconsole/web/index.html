@@ -4,9 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kage — DFIR Toolkit</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -69,33 +67,58 @@
     <label>Summary provider
       <select id="setProvider"></select>
     </label>
-    <label>Provider key <span class="keyhint" id="hintAI"></span>
+    <label data-ai>Provider key <span class="keyhint" id="hintAI"></span>
       <input id="setAI" type="password" autocomplete="off" placeholder="not configured">
     </label>
-    <label>Base URL <span class="opt" id="baseUrlHint">filled in automatically</span>
+    <label data-ai>Base URL <span class="opt" id="baseUrlHint">filled in automatically</span>
       <input id="setBaseUrl" type="text" spellcheck="false">
     </label>
-    <label>Summary model
+    <label data-ai>Summary model
       <input id="setModel" type="text">
     </label>
-    <label>Log source
+    <label>Evidence source
       <select id="setLogsSource">
-        <option value="collector">Collection (CyLR)</option>
-        <option value="live">Logs in place (winevt\Logs)</option>
-        <option value="custom">Custom folder</option>
+        <option value="collector">Live host — collection with CyLR</option>
+        <option value="remote">Remote host — CyLR over WinRM</option>
+        <option value="image">Disk image — E01, VMDK, VHDX, QCOW2, raw…</option>
+        <option value="live">Live host — logs read in place</option>
+        <option value="custom">Log folder of your choosing</option>
       </select>
     </label>
-    <label>Log folder <span class="opt">when custom</span>
+    <label data-source="remote">Remote host <span class="opt">name or IP of the Windows host</span>
+      <input id="setRemoteHost" type="text" spellcheck="false" placeholder="PC-FINANCE-07 or 10.20.4.11">
+    </label>
+    <label data-source="remote">Account <span class="opt">empty = your Windows session</span>
+      <input id="setRemoteUser" type="text" spellcheck="false" autocomplete="off" placeholder="ACME\ir-admin or .\Administrator">
+    </label>
+    <label data-source="remote">Password <span class="opt">kept for this session, never written</span>
+      <input id="setRemotePassword" type="password" autocomplete="new-password" placeholder="not set">
+    </label>
+    <label class="drawer__check" data-source="remote">
+      <input id="setRemoteSsl" type="checkbox">
+      <span>HTTPS (port 5986) — otherwise HTTP 5985, still encrypted by Kerberos/NTLM</span>
+    </label>
+    <div class="drawer__test" data-source="remote">
+      <button class="btn btn--ghost" id="btnRemoteTest" type="button">Test connection</button>
+      <span id="remoteTestResult" role="status"></span>
+    </div>
+    <label data-source="image">Disk image <span class="opt">.E01, .vmdk, .vhd(x), .qcow2, .vdi or raw</span>
+      <input id="setImagePath" type="text" spellcheck="false" placeholder="D:\cases\host01.E01">
+    </label>
+    <label data-source="image">Executables to extract <span class="opt">MB, for the YARA scan</span>
+      <input id="setImageBudget" type="number" min="0" max="65536" step="256">
+    </label>
+    <label data-source="custom">Log folder
       <input id="setLogsPath" type="text" spellcheck="false" placeholder="D:\collection\Logs">
     </label>
-    <label>CyLR arguments <span class="opt">--force-native if raw NTFS fails</span>
+    <label data-source="collector remote">CyLR arguments <span class="opt">--force-native if raw NTFS fails</span>
       <input id="setCylrArgs" type="text" spellcheck="false" placeholder="-v">
     </label>
     <label>YARA scan folder <span class="opt">empty = collected artefacts</span>
       <input id="setYaraPath" type="text" spellcheck="false" placeholder="C:\ or C:\Users\target">
     </label>
     <label>THOR Lite arguments
-      <input id="setThorArgs" type="text" spellcheck="false" placeholder="--quick --nocsv">
+      <input id="setThorArgs" type="text" spellcheck="false" placeholder="--nocsv">
     </label>
     <label>THOR time limit <span class="opt">minutes — 0 = unlimited</span>
       <input id="setThorTimeout" type="number" min="0" max="1440" step="5">
@@ -110,6 +133,7 @@
   </div>
   <div class="drawer__foot">
     <p class="drawer__note">Keys can be set once and for all in <code id="keyfilePath">apikeys.env</code> <span id="keyfileState"></span> — no need to retype them. They are never sent back to the browser.</p>
+    <span class="drawer__error" id="settingsError" role="alert" hidden></span>
     <button class="btn btn--primary" id="btnSaveSettings">Save</button>
   </div>
 </section>
@@ -143,8 +167,8 @@
         <p class="mono" id="windowLine">—</p>
         <svg class="spark" id="spark" viewBox="0 0 300 44" preserveAspectRatio="none" aria-hidden="true"></svg>
         <div class="verdict__export">
-          <a class="btn btn--ghost" id="btnHtml" href="/api/report.html" target="_blank" rel="noopener">Report</a>
-          <a class="btn btn--ghost" id="btnJson" href="/api/report.json">JSON</a>
+          <a class="btn btn--ghost is-off" id="btnHtml" href="/api/report.html" target="_blank" rel="noopener" aria-disabled="true" tabindex="-1">Report</a>
+          <a class="btn btn--ghost is-off" id="btnJson" href="/api/report.json" aria-disabled="true" tabindex="-1">JSON</a>
           <a class="btn btn--ghost" id="btnLog" href="/api/console.log">Log</a>
         </div>
       </div>
@@ -185,7 +209,7 @@
           <div class="chips" id="catChips"></div>
         </div>
         <div class="tablewrap"><table class="grid" id="alertTable">
-          <thead><tr><th>Timestamp</th><th>Level</th><th>Family</th><th>Rule</th><th>ID</th><th>Detail</th></tr></thead>
+          <thead><tr><th>Timestamp (UTC)</th><th>Level</th><th>Family</th><th>Rule</th><th>ID</th><th>Detail</th></tr></thead>
           <tbody></tbody>
         </table></div>
         <p class="empty" id="alertEmpty">No alert: the timeline has not been analysed yet.</p>
