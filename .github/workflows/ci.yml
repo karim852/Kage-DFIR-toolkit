@@ -60,13 +60,13 @@ jobs:
       # As root: the console's YARA step, like THOR itself, needs elevation,
       # and the runner's own user has none.
       - name: Full chain and reading pane
-        run: sudo -E env "PATH=$PATH" python tests/ui_check.py
+        run: sudo -E env "PATH=$PATH" "PLAYWRIGHT_BROWSERS_PATH=$HOME/.cache/ms-playwright" python tests/ui_check.py
 
       - name: Navigation, counts, histogram
-        run: sudo -E env "PATH=$PATH" python tests/ui_nav.py
+        run: sudo -E env "PATH=$PATH" "PLAYWRIGHT_BROWSERS_PATH=$HOME/.cache/ms-playwright" python tests/ui_nav.py
 
       - name: Every button and control
-        run: sudo -E env "PATH=$PATH" python tests/ui_buttons.py
+        run: sudo -E env "PATH=$PATH" "PLAYWRIGHT_BROWSERS_PATH=$HOME/.cache/ms-playwright" python tests/ui_buttons.py
 
       - name: Load — 6000 log lines at once
-        run: sudo -E env "PATH=$PATH" python tests/ui_flood.py
+        run: sudo -E env "PATH=$PATH" "PLAYWRIGHT_BROWSERS_PATH=$HOME/.cache/ms-playwright" python tests/ui_flood.py
