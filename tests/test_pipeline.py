@@ -1304,3 +1304,16 @@ def test_mitre_column_drives_the_kill_chain(tmp_path: Path) -> None:
     report = timeline.analyse_csv(csv_path).to_dict()
     assert dict(report["tactics"]) == {"Persistence": 2, "Defense Evasion": 2, "Credential Access": 1}
     assert report["distinct_rules"] == {"critical": 1, "high": 1, "medium": 0}
+
+
+def test_check_survives_a_legacy_console_code_page(tmp_path: Path) -> None:
+    """A Windows pipe in cp1252 cannot encode "→": --check used to crash with
+    UnicodeEncodeError and exit 1 (seen on the GitHub Windows runner)."""
+    import subprocess
+
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252",
+           "DFIR_CONFIG": str(tmp_path / "config.json")}
+    out = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "kage.py"),
+                          "--check"], cwd=tmp_path, env=env, capture_output=True, timeout=120)
+    assert out.returncode == 0, out.stderr.decode(errors="replace")[-500:]
+    assert b"Unicode" not in out.stderr

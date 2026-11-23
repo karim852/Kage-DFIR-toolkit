@@ -42,7 +42,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _safe_console() -> None:
+    """A Windows console or pipe on a legacy code page (cp1252, cp850) cannot
+    encode the arrows and dashes Kage prints: the first one raised an error and
+    --check exited 1. Replace what cannot be shown instead of crashing."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> None:
+    _safe_console()
     parser = build_parser()
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 

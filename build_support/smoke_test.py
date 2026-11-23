@@ -108,6 +108,8 @@ def main() -> int:
         out = subprocess.run([str(binary), "--check"], cwd=folder, capture_output=True,
                              text=True, timeout=120)
         check(out.returncode == 0, f"--check exits 0 ({out.returncode})")
+        if out.returncode != 0:
+            print(out.stdout[-3000:], out.stderr[-3000:], sep="\n")
         check("dissect.target" in out.stdout and "[ok]   module dissect.target" in out.stdout,
               "disk-image engine embedded")
         check("[ok]   module pypsrp" in out.stdout, "WinRM client embedded")
