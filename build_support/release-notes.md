@@ -1,3 +1,9 @@
+## Why 2.0
+
+The risk score was recalibrated: a score from 2.0 does not mean the same as a
+score from 1.x, so old and new reports should not be compared. Settings,
+folders and `python -m dfirconsole` stay compatible.
+
 ## What's new
 
 **Dead-disk triage.** Point Kage at an E01, VMDK, VHD/VHDX, QCOW2, VDI or raw

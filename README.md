@@ -180,7 +180,7 @@ Or right-click **`launch.bat`** → *Run as administrator*, which handles the
 virtualenv, the install and opens the browser for you.
 
 ```
-Kage DFIR Toolkit 1.6.0
+Kage DFIR Toolkit 2.0.0
   code      C:\Kage\dfirconsole
   workspace C:\Kage
   open      http://127.0.0.1:8787
@@ -990,8 +990,8 @@ Two GitHub Actions workflows live in `.github/workflows/`:
 Pushing a tag publishes a release with both files and `SHA256SUMS.txt`:
 
 ```bash
-git tag v1.6.0
-git push origin v1.6.0
+git tag v2.0.0
+git push origin v2.0.0
 ```
 
 To build locally:

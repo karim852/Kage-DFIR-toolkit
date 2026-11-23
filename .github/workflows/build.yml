@@ -1,6 +1,6 @@
 name: Build executables
 
-# A tag such as v1.6.0 builds both executables, smoke-tests them and publishes
+# A tag such as v2.0.0 builds both executables, smoke-tests them and publishes
 # a GitHub release. A pull request that touches the code or the build, and
 # "Run workflow", build and smoke-test them without releasing.
 on:
