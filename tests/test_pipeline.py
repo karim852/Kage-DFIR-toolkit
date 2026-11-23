@@ -708,8 +708,10 @@ def test_key_preview_never_leaks(tmp_path: Path, monkeypatch) -> None:
 
 
 # --- collector ------------------------------------------------------------
-def test_collection_requires_cylr(tmp_path: Path) -> None:
+def test_collection_requires_cylr(tmp_path: Path, monkeypatch) -> None:
     """CyLR is the collector: no silent substitution, ever."""
+    # Past the elevation check, which a CI runner without root would hit first.
+    monkeypatch.setattr("dfirconsole.pipeline.is_admin", lambda: True)
     settings = Settings(workspace=str(tmp_path / "ws"), demo_mode=False)
     for directory in (settings.root, settings.tools_dir, settings.evidence_dir,
                       settings.output_dir, *settings.tool_dirs):
@@ -724,6 +726,8 @@ def test_collection_requires_cylr(tmp_path: Path) -> None:
     assert "CyLR.exe not found" in case.steps["collect"].message
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="the CyLR stand-in is a POSIX script; Windows cannot run it")
 def test_real_cylr_collection_path(tmp_path: Path, monkeypatch) -> None:
     """Exercises the actual (non-demo) collection path end to end.
 
@@ -763,6 +767,8 @@ def test_real_cylr_collection_path(tmp_path: Path, monkeypatch) -> None:
     assert list(case.logs_dir.glob("*.evtx"))
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="the CyLR stand-in is a POSIX script; Windows cannot run it")
 def test_cylr_producing_no_archive_fails_clearly(tmp_path: Path, monkeypatch) -> None:
     """A silent CyLR must fail with a diagnosable message, never an
     AttributeError from a missing method."""
