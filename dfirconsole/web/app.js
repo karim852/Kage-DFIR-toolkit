@@ -115,6 +115,11 @@ function describeProvider() {
   const hint = $("#baseUrlHint");
   const input = $("#setBaseUrl");
   if (!spec) return;
+  // The local summary needs no key, URL or model: showing those fields only
+  // made people think something was missing.
+  document.querySelectorAll("#drawer [data-ai]").forEach((field) => {
+    field.hidden = spec.id === "none";
+  });
   input.placeholder = spec.base_url || "https://…";
   $("#setModel").placeholder = spec.default_model || "model name";
   hint.textContent = spec.base_url
@@ -150,12 +155,26 @@ function setLink(cls, label) {
   $("#linkLabel").textContent = label;
 }
 
+// Sequence number of the last server event applied. A "hello" (first
+// connection, reconnection, or resync after falling behind) replaces the
+// console with the backlog, so events it already covers are skipped rather
+// than shown twice.
+let lastSeq = 0;
+
 function handle(event) {
+  if (event.kind !== "hello" && event.seq != null) {
+    if (event.seq <= lastSeq) return;
+    lastSeq = event.seq;
+  }
   switch (event.kind) {
     case "hello":
+      $("#console").innerHTML = "";
+      pending = [];
+      lastSeq = 0;
       // The backlog can hold thousands of entries: keep only the tail, the log
       // file remains the complete source.
       (event.backlog || []).slice(-MAX_LINES).forEach(handle);
+      lastSeq = Math.max(lastSeq, event.seq || 0);
       applySnapshot(event.snapshot);
       break;
     case "log":
@@ -239,19 +258,34 @@ function updateCounters() {
   $("#nAlerts").textContent = ((state.report && state.report.findings) || []).length;
 }
 
+/* Only the fields that matter for the chosen evidence source are shown: a
+   CyLR argument field next to a disk image path invites the wrong edit. */
+function showSourceFields() {
+  const source = $("#setLogsSource").value;
+  document.querySelectorAll("#drawer [data-source]").forEach((field) => {
+    field.hidden = !field.dataset.source.split(" ").includes(source);
+  });
+}
+
 function applySettings(settings) {
   if (!settings) return;
   $("#caseName").textContent = settings.case_name || "NO REFERENCE";
   $("#wsLabel").textContent = settings.workspace || "—";
+  $(".bar__sub").title = settings.workspace || "";
+  const imageName = (settings.image_path || "").split(/[\\/]/).pop();
   $("#modeLabel").textContent = settings.demo_mode
     ? "demonstration mode"
-    : `live run · ${settings.platform}`;
+    : settings.logs_source === "image"
+      ? `disk image · ${imageName || "none selected"}`
+      : settings.logs_source === "remote"
+        ? `remote · ${settings.remote_host || "no host set"}`
+        : `live run · ${settings.platform}`;
 
   $("#setWorkspace").value = settings.workspace || "";
   $("#setCase").value = settings.case_name || "";
   $("#setAnalyst").value = settings.analyst || "";
   $("#setModel").value = settings.ai_model || "";
-  state.pendingProvider = settings.ai_provider || "anthropic";
+  state.pendingProvider = settings.ai_provider || "none";
   if (providers.length) {
     $("#setProvider").value = state.pendingProvider;
     describeProvider();
@@ -259,10 +293,29 @@ function applySettings(settings) {
   $("#setBaseUrl").value = settings.ai_base_url || "";
   $("#setLimit").value = settings.enrich_limit ?? 0;
   $("#setLogsSource").value = settings.logs_source || "collector";
+  $("#setImagePath").value = settings.image_path || "";
+  $("#setImageBudget").value = settings.image_files_mb ?? 1024;
+  $("#setRemoteHost").value = settings.remote_host || "";
+  $("#setRemoteUser").value = settings.remote_user || "";
+  $("#setRemoteSsl").checked = !!settings.remote_ssl;
+  $("#setRemotePassword").value = "";
+  $("#setRemotePassword").placeholder = settings.remote_password_set
+    ? "set for this session" : "not set";
+  const remoteOption = $('#setLogsSource option[value="remote"]');
+  remoteOption.disabled = settings.remote_support === false;
+  remoteOption.textContent = settings.remote_support === false
+    ? "Remote host — needs: pip install pypsrp"
+    : "Remote host — CyLR over WinRM";
+  const imageOption = $('#setLogsSource option[value="image"]');
+  imageOption.disabled = settings.image_support === false;
+  imageOption.textContent = settings.image_support === false
+    ? "Disk image — needs: pip install dissect.target"
+    : "Disk image — E01, VMDK, VHDX, QCOW2, raw…";
+  showSourceFields();
   $("#setCylrArgs").value = settings.cylr_args || "";
   $("#setThorArgs").value = settings.thor_args || "";
   $("#setYaraPath").value = settings.yara_path || "";
-  $("#setThorTimeout").value = settings.thor_timeout_min ?? 45;
+  $("#setThorTimeout").value = settings.thor_timeout_min ?? 0;
   $("#setLogsPath").value = settings.logs_path || "";
   $("#setDemo").checked = !!settings.demo_mode;
 
@@ -298,24 +351,36 @@ function mergeStep(step) {
   if (index === -1) state.steps.push(step);
   else state.steps[index] = step;
   renderChain();
+  if (step.id === "collect" && !state.report) renderReport();
   if (step.id === "analyse" && step.status === "done") fetchState();
 }
 
 async function fetchState() {
   try {
     const response = await fetch("/api/state");
-    applySnapshot(await response.json());
+    const snap = await response.json();
+    // Older than what the WebSocket already delivered: applying it would
+    // undo newer progress.
+    if (snap.seq != null && snap.seq < lastSeq) return;
+    applySnapshot(snap);
   } catch (_) { /* the WebSocket will catch up */ }
 }
 
 /* ---------------- chain of custody ---------------- */
+// Status of each step at the previous render: the "sealed" flash plays once,
+// when a step turns done, not on every redraw of the chain.
+const lastStatus = {};
+
 function renderChain() {
   const list = $("#chainList");
   list.innerHTML = "";
 
   state.steps.forEach((step) => {
     const li = document.createElement("li");
-    li.className = `tag is-${step.status}`;
+    const justSealed = step.status === "done" && lastStatus[step.id] && lastStatus[step.id] !== "done";
+    lastStatus[step.id] = step.status;
+    li.className = `tag is-${step.status}${justSealed ? " just-sealed" : ""}`;
+    li.dataset.step = step.id;
     li.tabIndex = 0;
     li.title = "Double-click: replay this step alone";
 
@@ -404,9 +469,15 @@ function renderControls() {
     setLink("is-live", "stream open");
   }
 
+  // Before any analysis these exports only lead to "No report available":
+  // keep them visibly and genuinely off, keyboard included.
   const hasReport = !!state.report;
-  $("#btnHtml").classList.toggle("is-off", !hasReport);
-  $("#btnJson").classList.toggle("is-off", !hasReport);
+  for (const id of ["#btnHtml", "#btnJson"]) {
+    $(id).classList.toggle("is-off", !hasReport);
+    $(id).setAttribute("aria-disabled", String(!hasReport));
+    if (hasReport) $(id).removeAttribute("tabindex");
+    else $(id).setAttribute("tabindex", "-1");
+  }
 }
 
 /* ---------------- console ---------------- */
@@ -486,14 +557,56 @@ $("#onlyImportant").addEventListener("change", (e) => {
 });
 
 /* ---------------- verdict ---------------- */
+// The header names the host from the timeline when there is one, otherwise
+// from the system capture (a disk image read without a timeline yet).
+function updateHostLabel() {
+  const report = state.report;
+  const fromTimeline = report && (report.computers || [])[0];
+  const fromSystem = ((state.system || {}).host || {}).hostname;
+  const differs = fromTimeline && fromSystem
+    && fromTimeline[0].split(".")[0].toLowerCase() !== fromSystem.toLowerCase();
+  $("#hostLabel").textContent = differs
+    ? `${fromSystem} · logs name ${fromTimeline[0]} · ${report.total} events`
+    : fromTimeline
+      ? `${fromTimeline[0]} · ${report.total} events`
+      : fromSystem || "host not identified";
+}
+
+// The number counts up to the new score while the arc fills, so a change
+// (YARA landing, enrichment) is seen rather than missed. Off for reduced motion.
+let scoreFrame = 0;
+function showScore(target) {
+  const el = $("#scoreValue");
+  const from = Number(el.textContent) || 0;
+  cancelAnimationFrame(scoreFrame);
+  if (from === target || matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    el.textContent = target;
+    return;
+  }
+  const start = performance.now();
+  const step = (now) => {
+    const k = Math.min(1, (now - start) / 700);
+    el.textContent = Math.round(from + (target - from) * (1 - Math.pow(1 - k, 3)));
+    if (k < 1) scoreFrame = requestAnimationFrame(step);
+  };
+  scoreFrame = requestAnimationFrame(step);
+}
+
 function renderReport() {
   const report = state.report;
   const verdict = $("#verdict");
 
   if (!report) {
+    cancelAnimationFrame(scoreFrame);
     $("#scoreValue").textContent = "—";
     $("#gaugeArc").style.strokeDashoffset = 327;
-    $("#verdictLine").textContent = "Waiting for a collection.";
+    // A finished collection with no analysis yet is not "waiting for a
+    // collection" (the image-only runs made that obvious).
+    const collected = state.steps.some((s) => s.id === "collect" && s.status === "done");
+    $("#verdictLine").textContent = collected
+      ? "Evidence collected — build and analyse the timeline to score it."
+      : "Waiting for a collection.";
+    updateHostLabel();
     $("#tallies").innerHTML = "";
     $("#windowLine").textContent = "—";
     $("#spark").innerHTML = "";
@@ -505,7 +618,7 @@ function renderReport() {
   }
 
   const score = report.risk_score || 0;
-  $("#scoreValue").textContent = score;
+  showScore(score);
   const arc = $("#gaugeArc");
   arc.style.strokeDashoffset = 327 - (327 * score) / 100;
 
@@ -544,10 +657,9 @@ function renderReport() {
     $("#tallies").append(tally);
   });
 
-  const host = (report.computers || [])[0];
-  $("#hostLabel").textContent = host ? `${host[0]} · ${report.total} events` : "host not identified";
+  updateHostLabel();
   $("#windowLine").textContent = report.first_seen
-    ? `${fmt(report.first_seen)} → ${fmt(report.last_seen)}`
+    ? `${fmt(report.first_seen)} → ${fmt(report.last_seen)} UTC`
     : "no timestamp available";
 
   drawSpark(report.activity || []);
@@ -556,12 +668,15 @@ function renderReport() {
   renderAttack();
 }
 
-function fmt(iso) {
+/* Every timestamp in UTC, with the year, as the report prints them. The
+   browser's local time without a year made the same alert read differently
+   on screen and on paper — and logs spanning years became ambiguous. */
+function fmt(iso, seconds = false) {
   if (!iso) return "—";
   const date = new Date(iso);
-  return Number.isNaN(date.getTime())
-    ? iso
-    : date.toLocaleString("en-GB", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  if (Number.isNaN(date.getTime())) return iso;
+  const text = date.toISOString().replace("T", " ");
+  return text.slice(0, seconds ? 19 : 16);
 }
 
 const CAT_COLOUR = {
@@ -720,7 +835,7 @@ function renderAlerts() {
     );
     const open = () => openReader(visible, index, "alert");
     tr.addEventListener("click", open);
-    tr.addEventListener("keydown", (e) => { if (e.key === "Enter") open(); });
+    tr.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); open(); } });
     body.append(tr);
   });
 }
@@ -807,8 +922,20 @@ function renderIocs() {
   const body = $("#iocTable").tBodies[0];
   body.innerHTML = "";
 
-  iocs.forEach((ioc) => {
+  // Indicators open in the reading pane like every other table.
+  const items = iocs.map((ioc) => ({
+    ...ioc,
+    threat: ioc.threat || "unchecked",
+    reputation: [...reputationCell(ioc).querySelectorAll(".rep > *")]
+      .map((n) => n.textContent).filter((s) => s && s !== "—").join(" · "),
+  }));
+  iocs.forEach((ioc, index) => {
     const tr = document.createElement("tr");
+    tr.className = "clickable";
+    tr.tabIndex = 0;
+    const open = () => openReader(items, index, "ioc");
+    tr.addEventListener("click", open);
+    tr.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); open(); } });
     const verdict = ioc.threat || "unchecked";
 
     const verdictCell = document.createElement("td");
@@ -924,7 +1051,7 @@ function renderYara() {
     );
     const open = () => openReader(rows, index, "yara");
     tr.addEventListener("click", open);
-    tr.addEventListener("keydown", (e) => { if (e.key === "Enter") open(); });
+    tr.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); open(); } });
     body.append(tr);
   });
 }
@@ -935,6 +1062,7 @@ function renderSystem() {
   const system = state.system;
   $("#sysEmpty").hidden = !!system;
   box.innerHTML = "";
+  updateHostLabel();
   if (!system) return;
 
   // -- machine identity
@@ -944,13 +1072,14 @@ function renderSystem() {
   dl.className = "kv";
   [["hostname", "Name"], ["os_name", "Operating system"], ["os_version", "Version"],
    ["domain", "Domain"], ["logon_server", "Domain controller"], ["model", "Hardware"],
-   ["install_date", "Installed on"], ["boot_time", "Booted on"],
+   ["timezone", "Time zone"], ["install_date", "Installed on"], ["boot_time", "Booted on"],
    ["hotfix_count", "Hotfixes"]].forEach(([key, label]) => {
     if (!host[key]) return;
     const dt = document.createElement("dt");
     dt.textContent = label;
     const dd = document.createElement("dd");
-    dd.textContent = host[key];
+    // Registry dates come as ISO strings; systeminfo dates as display text.
+    dd.textContent = /^\d{4}-\d{2}-\d{2}T/.test(host[key]) ? fmt(host[key]) + " UTC" : host[key];
     dl.append(dt, dd);
   });
   identity.body.append(dl);
@@ -983,7 +1112,9 @@ function renderSystem() {
       { text: user.admin ? "yes" : "no", cls: user.admin ? "c-flag" : "" },
       { text: user.enabled === null ? "—" : (user.enabled ? "enabled" : "disabled"),
         cls: user.enabled === false ? "c-detail" : "" },
-      { text: user.last_logon ? fmt(user.last_logon) : "never", cls: "c-ts" },
+      // A domain group has no logon of its own: "never" would be wrong.
+      { text: user.last_logon ? fmt(user.last_logon)
+          : user.enabled === null ? "—" : "never", cls: "c-ts" },
       { text: (user.flags || []).join(" · ") || "—", cls: "c-detail" },
     ]),
     users.map((user) => () => openReader(users, users.indexOf(user), "user")),
@@ -993,10 +1124,19 @@ function renderSystem() {
   // -- network
   const network = system.network || {};
   const connections = system.connections || [];
-  const net = card(
-    `Network — ${network.listening || 0} listening, ${network.established || 0} established, ` +
-    `${network.flagged || 0} flagged`, true);
-  net.body.append(table(
+  const offline = network.available === false;
+  const net = card(offline
+    ? "Network — not available from a disk image"
+    : `Network — ${network.listening || 0} listening, ${network.established || 0} established, ` +
+      `${network.flagged || 0} flagged`, true);
+  if (offline) {
+    // "0 listening" would read as "nothing was listening". The truth is
+    // that a disk image cannot say.
+    const note = document.createElement("p");
+    note.className = "empty";
+    note.textContent = network.note || "Sockets only exist on a running system.";
+    net.body.append(note);
+  } else net.body.append(table(
     ["Risk", "Proto", "Local", "Remote", "State", "Process", "Observations"],
     connections.map((c) => [
       { text: c.risk === "high" ? "high" : c.risk === "medium" ? "medium" : "—",
@@ -1012,6 +1152,25 @@ function renderSystem() {
     connections.map((c) => () => openReader(connections, connections.indexOf(c), "connection")),
   ));
   box.append(net.el);
+
+  // -- autoruns, read from the registry of a disk image
+  const autoruns = system.autoruns || [];
+  if (autoruns.length) {
+    const flaggedRuns = autoruns.filter((a) => a.risk !== "normal").length;
+    const runs = card(`Autoruns — ${autoruns.length} entry(ies), ${flaggedRuns} flagged`, true);
+    runs.body.append(table(
+      ["Risk", "Kind", "Name", "Command", "Observations"],
+      autoruns.map((a) => [
+        { text: a.risk === "normal" ? "—" : a.risk, cls: `c-risk risk-${a.risk}` },
+        { text: a.kind, cls: "c-detail" },
+        { text: a.name, cls: "c-rule" },
+        { text: a.command, cls: "c-mono" },
+        { text: (a.flags || []).join(" · ") || "—", cls: "c-detail" },
+      ]),
+      autoruns.map((a) => () => openReader(autoruns, autoruns.indexOf(a), "autorun")),
+    ));
+    box.append(runs.el);
+  }
 
   // -- logging coverage
   const coverage = system.coverage;
@@ -1044,14 +1203,26 @@ function renderSystem() {
     sub2.className = "covsub";
     sub2.textContent = "Local audit policy";
     cov.body.append(sub2);
-    cov.body.append(table(
-      ["State", "Subcategory", "Importance"],
-      (coverage.audit || []).map((a) => [
-        { text: a.state, cls: `c-risk cov-${a.state === "disabled" ? "missing" : "active"}` },
-        { text: a.label, cls: "c-rule" },
-        { text: a.importance, cls: "c-detail" },
-      ]),
-    ));
+    const audit = coverage.audit || [];
+    if (!audit.length || audit.every((a) => a.state === "unknown")) {
+      // Fifteen rows of "unknown" said nothing; one sentence says why.
+      const note = document.createElement("p");
+      note.className = "empty";
+      note.textContent = system.source === "image"
+        ? "Not captured: the audit policy is read with auditpol on a live host, not from a disk image."
+        : "Not captured: auditpol did not answer (it needs an elevated console).";
+      cov.body.append(note);
+    } else {
+      cov.body.append(table(
+        ["State", "Subcategory", "Importance"],
+        audit.map((a) => [
+          { text: a.state, cls: a.state === "unknown" ? "c-risk"
+            : `c-risk cov-${a.state === "disabled" ? "missing" : "active"}` },
+          { text: a.label, cls: "c-rule" },
+          { text: a.importance, cls: "c-detail" },
+        ]),
+      ));
+    }
     box.append(cov.el);
   }
 
@@ -1117,7 +1288,7 @@ function table(headers, rows, handlers) {
       tr.className = "clickable";
       tr.tabIndex = 0;
       tr.addEventListener("click", handlers[index]);
-      tr.addEventListener("keydown", (e) => { if (e.key === "Enter") handlers[index](); });
+      tr.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); handlers[index](); } });
     }
     tbody.append(tr);
   });
@@ -1139,6 +1310,9 @@ const READER_LABELS = {
   local_port: "Local port", remote_ip: "Remote address", remote_port: "Remote port",
   state: "State", pid: "PID", process: "Process", service: "Service",
   risk: "Risk", path: "Path", kind: "Type", age_days: "Age (days)",
+  command: "Command", location: "Location", user: "User",
+  type: "Type", value: "Value", count: "Seen", threat: "Verdict",
+  reputation: "Reputation", rules: "Rules",
 };
 
 const READER_VIEWS = {
@@ -1156,10 +1330,16 @@ const READER_VIEWS = {
                         "flags"] },
   root: { kind: "Disk root entry", title: ["path", "name"],
           order: ["risk", "path", "kind", "created", "age_days", "flags"] },
+  ioc: { kind: "Indicator", title: ["value"],
+         order: ["type", "value", "count", "threat", "reputation", "rules"] },
+  autorun: { kind: "Autorun", title: ["name"],
+             order: ["risk", "kind", "name", "command", "location", "user", "flags"] },
 };
 
 function openReader(list, index, kind) {
-  state.reader = { list, index, kind };
+  // Remember the row so Close puts the keyboard back where it was.
+  const origin = $("#reader").hidden ? document.activeElement : state.reader.origin;
+  state.reader = { list, index, kind, origin };
   $("#reader").hidden = false;
   document.body.style.overflow = "hidden";
   drawReader();
@@ -1169,6 +1349,8 @@ function openReader(list, index, kind) {
 function closeReader() {
   $("#reader").hidden = true;
   document.body.style.overflow = "";
+  const origin = state.reader && state.reader.origin;
+  if (origin && origin.isConnected) origin.focus();
 }
 
 function drawReader() {
@@ -1192,7 +1374,7 @@ function drawReader() {
     let value = item[key];
     if (value == null || value === "" || (Array.isArray(value) && !value.length)) continue;
     if (Array.isArray(value)) value = value.join(" · ");
-    if (typeof value === "boolean") value = value ? "oui" : "non";
+    if (typeof value === "boolean") value = value ? "yes" : "no";
     if (key === "level") value = LEVEL_LABEL[value] || value;
     if (key === "category") value = CAT_LABEL[value] || value;
     if (key === "timestamp") value = `${fmt(value)}   (${item[key]})`;
@@ -1311,7 +1493,6 @@ function renderOverview() {
     row.addEventListener("click", () => {
       state.cats = new Set([cat.id]);
       $("#catChips").innerHTML = "";
-  $("#yaraChips").innerHTML = "";
       navigate("/alerts");
     });
     row.classList.add("clickable");
@@ -1477,25 +1658,70 @@ $("#btnSettings").addEventListener("click", () => {
   $("#btnSettings").setAttribute("aria-expanded", String(!drawer.hidden));
 });
 
+$("#setLogsSource").addEventListener("change", showSourceFields);
+
+// Saves first (the test uses the saved settings), then asks the host who it is.
+$("#btnRemoteTest").addEventListener("click", async () => {
+  const out = $("#remoteTestResult");
+  out.className = "";
+  out.textContent = "Connecting…";
+  const payload = {
+    logs_source: "remote",
+    remote_host: $("#setRemoteHost").value.trim(),
+    remote_user: $("#setRemoteUser").value.trim(),
+    remote_ssl: $("#setRemoteSsl").checked,
+  };
+  const password = $("#setRemotePassword").value;
+  if (password) payload.remote_password = password;
+  const saved = await fetch("/api/settings", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  if (saved.ok) {
+    const settings = await saved.json();
+    $("#setRemotePassword").value = "";
+    $("#setRemotePassword").placeholder = settings.remote_password_set ? "set for this session" : "not set";
+  }
+  const response = await fetch("/api/remote/test", { method: "POST" });
+  const data = await response.json().catch(() => ({}));
+  if (response.ok && data.admin) {
+    out.className = "is-ok";
+    out.textContent = `✔ ${data.hostname} · ${data.os || "Windows"} · administrator · ${data.transport}`;
+  } else if (response.ok) {
+    out.className = "is-bad";
+    out.textContent = `${data.hostname} answered, but without administrator rights`;
+  } else {
+    out.className = "is-bad";
+    out.textContent = data.detail || `HTTP ${response.status}`;
+  }
+});
+
 $("#btnSaveSettings").addEventListener("click", async () => {
   const payload = {
     workspace: $("#setWorkspace").value.trim(),
     case_name: $("#setCase").value.trim() || "CASE-001",
     analyst: $("#setAnalyst").value.trim(),
-    ai_model: $("#setModel").value.trim() || "claude-sonnet-4-6",
+    // Empty means "the provider's default model", never a Claude model name
+    // sent to Groq or Mistral.
+    ai_model: $("#setModel").value.trim(),
     ai_provider: $("#setProvider").value,
     ai_base_url: $("#setBaseUrl").value.trim(),
     enrich_limit: Math.max(0, Number($("#setLimit").value) || 0),
     logs_source: $("#setLogsSource").value,
     cylr_args: $("#setCylrArgs").value.trim() || "-v",
-    thor_args: $("#setThorArgs").value.trim() || "--quick --nocsv",
+    thor_args: $("#setThorArgs").value.trim() || "--nocsv",
     yara_path: $("#setYaraPath").value.trim(),
     thor_timeout_min: Number($("#setThorTimeout").value) || 0,
     logs_path: $("#setLogsPath").value.trim(),
+    image_path: $("#setImagePath").value.trim().replace(/^"(.*)"$/, "$1"),
+    image_files_mb: Math.max(0, Number($("#setImageBudget").value) || 0),
+    remote_host: $("#setRemoteHost").value.trim(),
+    remote_user: $("#setRemoteUser").value.trim(),
+    remote_ssl: $("#setRemoteSsl").checked,
     demo_mode: $("#setDemo").checked,
   };
   // A field left empty keeps the key already stored server-side.
-  const secrets = { virustotal_key: "#setVT", abuseipdb_key: "#setAbuse", anthropic_key: "#setAI" };
+  const secrets = { virustotal_key: "#setVT", abuseipdb_key: "#setAbuse", anthropic_key: "#setAI",
+                    remote_password: "#setRemotePassword" };
   for (const [key, sel] of Object.entries(secrets)) {
     const value = $(sel).value.trim();
     if (value) payload[key] = value;
@@ -1507,8 +1733,17 @@ $("#btnSaveSettings").addEventListener("click", async () => {
   if (response.ok) {
     applySettings(await response.json());
     Object.values(secrets).forEach((sel) => { $(sel).value = ""; });
+    $("#settingsError").hidden = true;
     $("#drawer").hidden = true;
     $("#btnSettings").setAttribute("aria-expanded", "false");
+  } else {
+    // A refused value used to leave the drawer open with no explanation.
+    const error = await response.json().catch(() => ({}));
+    const detail = Array.isArray(error.detail)
+      ? error.detail.map((d) => `${(d.loc || []).slice(-1)[0]}: ${d.msg}`).join(" · ")
+      : error.detail || `HTTP ${response.status}`;
+    $("#settingsError").textContent = `Not saved — ${detail}`;
+    $("#settingsError").hidden = false;
   }
 });
 

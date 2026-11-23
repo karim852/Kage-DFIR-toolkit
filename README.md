@@ -5,10 +5,12 @@
 <p align="center">
 <img src="https://img.shields.io/badge/Python-3.10+-3b82f6?style=flat-square&logo=python&logoColor=white">
 <img src="https://img.shields.io/badge/Steps-11-22c55e?style=flat-square">
-<img src="https://img.shields.io/badge/Tests-115_passing-22c55e?style=flat-square">
+<img src="https://img.shields.io/badge/Tests-158_+_4_browser_runs-22c55e?style=flat-square">
 <img src="https://img.shields.io/badge/API_Key-Optional-22c55e?style=flat-square">
 <img src="https://img.shields.io/badge/Platform-Windows-0ea5e9?style=flat-square">
-<img src="https://img.shields.io/badge/Linux-in_progress-f59e0b?style=flat-square">
+<img src="https://img.shields.io/badge/Remote-WinRM-8b5cf6?style=flat-square">
+<img src="https://img.shields.io/badge/Dead_disk-E01_·_VMDK_·_VHDX_·_raw-8b5cf6?style=flat-square">
+<img src="https://img.shields.io/badge/Single_file-kage.exe-0ea5e9?style=flat-square">
 <img src="https://img.shields.io/badge/License-MIT-6b7280?style=flat-square">
 <a href="https://ko-fi.com/k0r1m"><img src="https://img.shields.io/badge/Ko--fi-Support-FF5E5B?style=flat-square&logo=kofi&logoColor=white"></a>
 <a href="https://youtu.be/PVJ-QQXbdfI"><img src="https://img.shields.io/badge/Demo-Watch_on_YouTube-FF0000?style=flat-square&logo=youtube&logoColor=white"></a>
@@ -21,9 +23,22 @@ Sigma, **THOR Lite** scans for YARA matches, **VirusTotal** and **AbuseIPDB**
 qualify the indicators, and the AI provider of your choice drafts the write-up.
 Every stage streams live, seals what it produced, and can be replayed alone.
 
+Not sitting at the suspect machine? Run the chain **remotely** on any Windows
+host you administer, over WinRM. No live host at all? Give it a **disk image**
+(E01, VMDK, VHD/VHDX, QCOW2, VDI or raw) and the same chain runs on the dead
+disk, from Windows or Linux.
+
+```powershell
+kage.exe                        # one file, no Python → http://127.0.0.1:8787
+kage.exe --remote PC07              # remote triage over WinRM
+kage.exe --image D:\case\PC07.E01  # dead-disk triage
+```
+
+Or from source:
+
 ```bash
 pip install -r requirements.txt
-python -m dfirconsole          # → http://127.0.0.1:8787
+python -m dfirconsole
 ```
 
 <p align="center">
@@ -39,6 +54,8 @@ python -m dfirconsole          # → http://127.0.0.1:8787
 
 - [Installation](#-installation)
 - [Running your first scan](#-running-your-first-scan)
+- [Remote triage](#-remote-triage)
+- [Dead-disk triage](#-dead-disk-triage)
 - [Adding THOR Lite manually](#-adding-thor-lite-manually)
 - [The chain](#-the-chain)
 - [Risk score](#-risk-score)
@@ -51,14 +68,63 @@ python -m dfirconsole          # → http://127.0.0.1:8787
 - [Configuration](#-configuration)
 - [CLI reference](#-cli-reference)
 - [Troubleshooting](#-troubleshooting)
-- [Linux version](#-linux-version--in-progress)
+- [Builds and releases](#-builds-and-releases)
+- [Linux version](#-linux-version)
 - [Credits](#-credits)
 
 ---
 
 ## 📦 Installation
 
-### Requirements
+### The single executable (recommended)
+
+Download **`kage-windows-x64.exe`** from the
+[Releases](../../releases) page, rename it `kage.exe` if you like, and put it in
+an empty folder: `C:\Kage`, a USB stick, a case share.
+
+```
+C:\Kage\
+└── kage.exe          ← that is all you need
+```
+
+Run it **as administrator**. The console window shows the address and the
+browser opens on its own. Python is not needed; the web interface, its fonts
+and the disk-image engine are all inside the file.
+
+What appears next to it on first use:
+
+```
+C:\Kage\
+├── kage.exe
+├── config.json       your settings (written when you click Save)
+├── apikeys.env       optional, your keys (you create it)
+├── tools\
+│   ├── cylr\         downloaded on first run
+│   ├── hayabusa\     downloaded on first run
+│   └── thor\         optional, you place it (see below)
+├── evidence\
+└── output\           reports, timeline, logs, manifests
+```
+
+**Is a THOR licence the only extra file?** Not quite. If you want the YARA
+step, you place the **whole THOR Lite folder** in `tools\thor\` (scanner,
+`.lic`, `signatures\`, `config\`), because THOR reads its rules from its own
+folder. Nextron's licence forbids shipping it inside Kage. Without it, that one
+step is skipped and everything else works.
+
+**Why are CyLR and Hayabusa not inside the exe?** Their licences (GPL-3.0 and
+AGPL-3.0) come with obligations a single closed bundle would break, and they
+release often. Kage downloads the current Windows build into `tools\` on first
+run. On a machine **without internet**, run it once on a connected machine and
+copy the `tools\` folder across with `kage.exe`.
+
+> The exe is not code-signed. SmartScreen may show *Windows protected your PC*:
+> click **More info → Run anyway**, or check the file against
+> `SHA256SUMS.txt` published with each release first.
+
+### From source
+
+#### Requirements
 
 | | |
 |---|---|
@@ -68,7 +134,7 @@ python -m dfirconsole          # → http://127.0.0.1:8787
 | Disk | a few GB free for the collection |
 
 
-### Install
+#### Install
 
 ```powershell
 # 1. Extract Kage anywhere — Desktop, C:\Kage, a USB stick, it does not matter
@@ -104,7 +170,7 @@ Tooling
            → optional step — it will simply be skipped
 ```
 
-### Launch — as Administrator
+#### Launch — as Administrator
 
 ```powershell
 python -m dfirconsole
@@ -114,7 +180,7 @@ Or right-click **`launch.bat`** → *Run as administrator*, which handles the
 virtualenv, the install and opens the browser for you.
 
 ```
-Kage DFIR Toolkit 1.5.0
+Kage DFIR Toolkit 1.6.0
   code      C:\Kage\dfirconsole
   workspace C:\Kage
   open      http://127.0.0.1:8787
@@ -207,8 +273,8 @@ With API keys configured:
 ☑ Write the summary        the AI drafts the report
 ```
 
-Without keys, both are marked *skipped* and a **local write-up** is produced
-instead — same structure, no network call.
+Without keys, enrichment is marked *skipped* and the summary step writes a
+**local write-up** instead. Same structure, no network call.
 
 ### Step 7 — Export
 
@@ -220,6 +286,145 @@ Top right of the dashboard:
 
 > 💡 **Replay a single step:** double-click its tag in the left column. Useful
 > when Hayabusa fails but the collection is fine — no need to collect twice.
+
+---
+
+## 🛰️ Remote triage
+
+You administer the suspect machine but you are not in front of it. Kage stays
+on **your** workstation and runs the usual chain on the remote host through
+**WinRM** (PowerShell Remoting), the channel Windows admins already use.
+
+```powershell
+kage.exe --remote PC-FINANCE-07                         # your Windows session (domain)
+kage.exe --remote 10.20.4.11 --remote-user .\Administrator   # a local account, password asked once
+```
+
+or **Settings → Evidence source → Remote host**, fill in the host, click
+**Test connection**, **Save**.
+
+### What happens on the remote host
+
+| Step | On the remote host | On your workstation |
+|---|---|---|
+| Connect | checks the session has the administrator token | |
+| Collect | `CyLR.exe` is pushed to `C:\Windows\Temp\Kage-<case>`, run with your CyLR arguments | |
+| Fetch | | the archive is downloaded in 4 MB chunks, its **SHA-256** checked against the one the host computed |
+| Clean up | the temporary folder is deleted, **even if a step failed** | |
+| System context | the **same commands** as a live capture: `systeminfo`, `Get-LocalUser`, `netstat -ano`, `tasklist`, `auditpol`, `Get-WinEvent -ListLog`, the C:\ listing | the **same parsers** |
+| Timeline, analysis, YARA, report | | exactly as for a local collection |
+
+Everything is recorded in `output\<case>-remote-manifest.json`: host, account,
+transport, CyLR hash, archive hash, start and end times, clean-up status. The
+manifest is part of the collection seal and the report names the host and the
+archive hash.
+
+### Same results as a local run
+
+Same CyLR, same archive, same Hayabusa, same parsers. The test suite proves it
+on a simulated host: the remote capture and the live capture of that host give
+**identical** system context and identical event logs, byte for byte.
+`tests/e2e_sources.py` goes further with the real Hayabusa and real attack
+logs: collector, live, log folder, remote and seven image formats all give
+the same timeline (43 events, 5 critical, 15 high on the sample set).
+
+### What the remote host needs
+
+| | |
+|---|---|
+| WinRM enabled | on by default on Windows Server 2012 and later; **off on Windows 10 / 11**: run `Enable-PSRemoting -Force` on the target, or enable it fleet-wide by GPO |
+| Firewall | TCP **5985** (HTTP, still encrypted by Kerberos/NTLM) or **5986** (HTTPS) from your workstation |
+| Account | member of the host's **Administrators** group |
+| Local account | UAC strips its admin token remotely unless `LocalAccountTokenFilterPolicy` is 1; a domain account avoids this |
+
+**Credentials.** Leave the account empty on a domain workstation: your Windows
+session authenticates (Kerberos), nothing is typed or stored. A password you
+type is kept **in memory for the session only**, never written to
+`config.json`. To provide it unattended, set `KAGE_REMOTE_PASSWORD` in the
+environment or in `apikeys.env`.
+
+**From Linux too.** The WinRM client is pure Python, so the Linux build can
+triage a Windows host remotely. It pushes the Windows CyLR and runs the Linux
+Hayabusa locally.
+
+> **Large collections.** WinRM is not a file-transfer protocol: expect a few
+> MB/s. The default CyLR set (logs, registry, `$MFT`) is usually a few hundred
+> MB. Trim it with CyLR arguments if the link is slow.
+
+---
+
+## 💽 Dead-disk triage
+
+When the host is already powered off, seized, or only reachable as a disk image,
+point Kage at the image. It opens it **read-only**, finds the Windows volume and
+pulls out what the chain needs. No mounting, no admin rights, no Windows
+required: the Linux build does it too.
+
+| Format | Extensions |
+|---|---|
+| EnCase / EWF | `.E01`, `.Ex01`, `.S01` (point to the first segment; the others are found in the same folder) |
+| VMware | `.vmdk` (plain and split) |
+| Hyper‑V / Azure | `.vhd`, `.vhdx` |
+| QEMU / KVM | `.qcow2` |
+| VirtualBox | `.vdi` |
+| Raw | `.dd`, `.raw`, `.img`, `.bin`, `.001` |
+
+### Start on an image
+
+```powershell
+kage.exe --image D:\case\PC07.E01
+```
+
+or **Settings → Evidence source → Disk image**, paste the path (with or without
+quotes, the way Explorer copies it), **Save**. The status bar now reads
+`disk image · PC07.E01`.
+
+Then tick only what makes sense for a dead disk and run:
+
+```
+☑ Prepare the workspace
+☑ Collect the artefacts        read from the image, CyLR not used
+☑ Capture the system context   from the registry hives, not live commands
+☑ Update the Sigma rules
+☑ Build the timeline
+☑ Analyse the timeline
+```
+
+### What is read from the image
+
+| Artefact | Source in the image | Used by |
+|---|---|---|
+| Event logs | `Windows\System32\winevt\Logs\*.evtx` | Hayabusa timeline, log coverage |
+| Host identity | `SYSTEM` and `SOFTWARE` hives | name, OS build, domain, time zone, install date |
+| Local accounts | `SAM` hive | enabled or not, last logon, admin membership, nested domain groups |
+| Persistence | Run keys and services | **Autoruns** card, user-writable paths flagged |
+| Disk root | `C:\` listing | odd folders, with their age compared to the last log write |
+| Prefetch | `Windows\Prefetch` | kept in the extraction |
+| Executables | `Downloads`, `Desktop`, `Documents`, `AppData`, `Users\Public`, `ProgramData`, `Windows\Temp`, `PerfLogs` | YARA scope (50 MB per file, 1 GB total, set in Settings) |
+
+Everything extracted is listed in `output\<case>-image-manifest.json`, one line
+per file with its path in the image, its size and its **SHA-256**. The manifest
+also records the image itself: format, segments, size and a SHA-256 of its first
+64 MB (enough to tell two images apart without hashing 500 GB). The full
+acquisition hash stays the job of `ewfverify` or your imaging tool. The
+manifest is part of the collection seal.
+
+### What a disk image cannot give you
+
+| Missing | Why |
+|---|---|
+| Network sockets | they only exist on a running system |
+| Audit policy | read with `auditpol` on a live host |
+| Running processes | same reason as sockets |
+
+The **System** view and the report say so plainly instead of showing empty
+tables. Encrypted volumes (BitLocker) must be decrypted before Kage can read
+them.
+
+### YARA on an image
+
+Leave **Settings → YARA scan folder** empty and THOR scans the extraction: the
+executables pulled from the image, not your own machine.
 
 ---
 
@@ -237,8 +442,8 @@ You receive the scanner **and a licence file** (`.lic`) — usually by email.
 
 ### 2. Drop it in `tools\thor\`
 
-Kage already created that folder for you at first launch. Copy the archive's
-contents into it, **keeping everything together**:
+Kage creates that folder at first launch, next to `kage.exe` or next to the
+sources. Copy the archive's contents into it, **keeping everything together**:
 
 ```
 C:\Kage\
@@ -267,7 +472,7 @@ tools\
 ### 3. Verify
 
 ```powershell
-python preflight.py
+kage.exe --check          # or: python preflight.py
 ```
 
 ```
@@ -286,7 +491,7 @@ If the licence line shows `[!]`, THOR will start and stop immediately.
 
 | Value | Scans | Takes |
 |---|---|---|
-| *(empty)* | the artefacts CyLR just collected | minutes |
+| *(empty)* | the artefacts CyLR just collected, or the files extracted from a disk image | minutes |
 | `C:\Users\target` | one user profile | minutes |
 | `C:\` | the whole system volume | **hours** |
 
@@ -330,18 +535,42 @@ dropped rather than failing the command.
 A **triage priority, not a proof** — and never published without its breakdown.
 
 ```
-80 / 100        Compromise confirmed by multiple sources
-                CONFIDENCE HIGH · 441 events analysed
+71 / 100        Compromise highly likely — corroboration still limited
+                CONFIDENCE MEDIUM · 43 events analysed
 
-SEVERITY        45 / 45   8 critical, 10 high, 3 medium
-KILL CHAIN      25 / 25   10 ATT&CK tactics, 7 decisive
+SEVERITY        43 / 45   5 critical, 15 high, 9 medium · 17 distinct rules
+KILL CHAIN      24 / 25   8 ATT&CK tactics, 6 decisive
 REPUTATION       0 / 20   no indicator confirmed externally
-CORROBORATION   10 / 10   3 YARA detections · 3 active connections to public hosts
+CORROBORATION    4 / 10   1 suspicious connection to a public host
 ```
 
-Four independent axes, **each capped**. That is what stops one noisy rule firing
-three hundred times from reaching the same verdict as a genuine multi-stage
-intrusion.
+Four independent axes, **each capped**:
+
+| Axis | Max | What it counts |
+|---|---|---|
+| Severity | 45 | **distinct** detection rules (critical 8, high 3, medium 1), plus a small volume bonus that stops past about 20 alerts |
+| Kill chain | 25 | ATT&CK tactics of the **alerts**, from each rule's own tags (Hayabusa's verbose profile); decisive tactics count twice |
+| Reputation | 20 | indicators confirmed malicious (10) or suspicious (3) by VirusTotal / AbuseIPDB |
+| Corroboration | 10 | YARA detections (6), live connections **already flagged** as suspicious (4) |
+
+Both curves rise fast at first and flatten near the top, so one noisy rule
+firing three hundred times weighs like one rule, and only a broad intrusion
+gets near the cap.
+
+**Calibrated on real attacks.** `tests/score_eval.py` scores about 1 000 cases
+built from the 600 public Hayabusa sample recordings (one technique, two,
+three, five, eight, and noisy repeats). Median scores, before and after this
+calibration:
+
+| | one technique | 3 techniques | 5 techniques | 8 techniques | same technique ×20 |
+|---|---|---|---|---|---|
+| Before | 47 | 70 | 70 | 70 | +9 |
+| Now | 27 | 49 | 61 | 65 | +4 |
+
+The old curves gave the full 45 for one critical plus one high alert and the
+full 25 for five tactics, so anything bigger than one technique sat on 70.
+Timeline evidence alone now stays under 70: **the top band takes corroboration**
+(a YARA hit, a flagged socket, a confirmed indicator).
 
 **Confidence is separate from severity.** It counts how many independent sources
 agree and whether logging coverage was sufficient — so a high score built on
@@ -625,7 +854,7 @@ notepad apikeys.env
 ```
 
 ```ini
-# apikeys.env — sits next to launch.bat
+# apikeys.env — sits next to kage.exe (or launch.bat)
 VT_API_KEY=your_virustotal_key
 ABUSEIPDB_API_KEY=your_abuseipdb_key
 
@@ -678,18 +907,34 @@ explanation considered.
 
 ## 📟 CLI reference
 
+`kage.exe` and `python -m dfirconsole` take the same options.
+
 ```
-python -m dfirconsole                  console on 127.0.0.1:8787
-python -m dfirconsole --port 9000      custom port
-python -m dfirconsole --demo           synthetic data, no collection
-python preflight.py                    environment check
+kage.exe                               console on 127.0.0.1:8787, browser opens
+kage.exe --port 9000                   custom port
+kage.exe --demo                        synthetic data, no collection
+kage.exe --image D:\case\PC07.E01      start on a disk image
+kage.exe --remote PC07                 start on a remote host (WinRM)
+kage.exe --remote PC07 --remote-user .\Administrator   password asked once
+kage.exe --no-browser                  do not open the browser
+kage.exe --check                       environment check, writes nothing
+kage.exe --version                     print the version
+
 python preflight.py D:\CASE42          check another workspace
 
-python -m pytest tests/ -q             115 tests
+python -m pytest tests/ -q             158 tests, disk images and remote hosts included
 python tests/ui_check.py               browser: full chain, reading pane
 python tests/ui_nav.py                 browser: navigation, counts, histogram
 python tests/ui_flood.py               browser: 6000 log lines at once
+python tests/ui_buttons.py             browser: every button, filter and export
+python tests/e2e_sources.py --hayabusa <dir> --logs <evtx dir> [--images <dir>]
+                                       every source, real Hayabusa, same results
+python tests/score_eval.py <hayabusa verbose csv>
+                                       score calibration on ~1 000 real cases
 ```
+
+All times shown in the console, the report and the exports are **UTC**, with
+the year, so a timeline lines up with other tools whatever the analyst's clock.
 
 Browser runs need `pip install playwright && playwright install chromium`.
 
@@ -711,15 +956,61 @@ for the Windows API, which works when partition detection fails on a disk.
 
 **THOR starts then goes silent**
 Its licence is missing or expired, or `signatures\` was not copied next to the
-binary. Run `preflight.py` to confirm.
+binary. Run `kage.exe --check` to confirm.
+
+**"Image not found" / "no Windows volume found in the image"**
+Check the path points to the first segment (`.E01`, not `.E02`) and that all
+segments sit in the same folder. A BitLocker volume must be decrypted first.
+
+**Remote host: "no WinRM answer"**
+On the target, as administrator: `Enable-PSRemoting -Force`, then allow TCP 5985
+from your workstation. `Test-WSMan <host>` from your workstation must answer.
+
+**Remote host: "connected but without administrator rights"**
+The account is not in the host's Administrators group, or it is a local
+account stripped by UAC. Use a domain admin account, or set
+`LocalAccountTokenFilterPolicy` to 1 on the target.
+
+**The exe is blocked or deleted by the antivirus**
+One-file executables unpack themselves at start, which some engines dislike.
+Compare the hash with `SHA256SUMS.txt` from the release, then allow it, or run
+from source.
 
 ---
 
-## 🐧 Linux version — in progress
+## 🏗️ Builds and releases
 
-A Linux triage chain is being built on the same console, same views, same
-scoring model. The parsers are already platform-agnostic; what changes is the
-evidence layer:
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+| Workflow | When | What it does |
+|---|---|---|
+| `ci.yml` | every push and pull request | unit tests on Windows and Linux, then the four browser runs |
+| `build.yml` | every `v*` tag, or by hand from the Actions tab | builds `kage-windows-x64.exe` and `kage-linux-x64` with PyInstaller, smoke-tests each one from an empty folder (demo chain and an E01 triage), publishes them as build artifacts |
+
+Pushing a tag publishes a release with both files and `SHA256SUMS.txt`:
+
+```bash
+git tag v1.6.0
+git push origin v1.6.0
+```
+
+To build locally:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pyinstaller kage.spec                       # → dist/kage.exe or dist/kage
+python build_support/smoke_test.py dist/kage.exe
+```
+
+---
+
+## 🐧 Linux version
+
+**Today:** the Linux build (`kage-linux-x64`) runs the console and does full
+**dead-disk triage** of Windows images, with the Linux build of Hayabusa.
+
+**In progress:** triage of Linux hosts themselves, on the same console, views
+and scoring model. What changes is the evidence layer:
 
 | Windows | Linux (in progress) |
 |---|---|

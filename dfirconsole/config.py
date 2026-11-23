@@ -15,7 +15,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = APP_DIR.parent
+# Frozen as a single executable (PyInstaller), the code runs from a temporary
+# folder deleted on exit: anything that must survive — config.json,
+# apikeys.env, the tools — belongs next to the .exe instead.
+FROZEN = bool(getattr(sys, "frozen", False))
+PROJECT_DIR = Path(sys.executable).resolve().parent if FROZEN else APP_DIR.parent
 CONFIG_PATH = Path(os.environ.get("DFIR_CONFIG", PROJECT_DIR / "config.json"))
 # Key file kept separate from the rest: it can stay out of the repository, be
 # copied from one workstation to another, or live on an encrypted USB stick.
@@ -28,6 +32,7 @@ _KEY_ALIASES = {
     "ai_model": ("AI_MODEL",),
     "ai_provider": ("AI_PROVIDER",),
     "ai_base_url": ("AI_BASE_URL", "OPENAI_BASE_URL"),
+    "remote_password": ("KAGE_REMOTE_PASSWORD",),
 }
 
 
@@ -76,12 +81,16 @@ TOOL_SOURCES = {
     },
     "hayabusa": {
         "repo": "Yamato-Security/hayabusa",
-        "asset": r"hayabusa-[\d.]+-win-x64\.zip$",
-        "fallback": "https://github.com/Yamato-Security/hayabusa/releases/download/v4.0.0/hayabusa-4.0.0-win-x64.zip",
-        "binary": "hayabusa*.exe",
+        # Dead-disk triage runs on Linux too, so Hayabusa follows the host OS.
+        "asset": (r"hayabusa-[\d.]+-win-x64\.zip$" if IS_WINDOWS
+                  else r"hayabusa-[\d.]+-lin-x64-gnu\.zip$"),
+        "fallback": ("https://github.com/Yamato-Security/hayabusa/releases/download/v4.0.0/"
+                     + ("hayabusa-4.0.0-win-x64.zip" if IS_WINDOWS
+                        else "hayabusa-4.0.0-lin-x64-gnu.zip")),
+        "binary": "hayabusa*.exe" if IS_WINDOWS else "hayabusa-*-lin-*",
     },
 }
-HAYABUSA_BIN = "hayabusa-*-win-x64.exe"
+HAYABUSA_BIN = "hayabusa-*-win-x64.exe" if IS_WINDOWS else "hayabusa-*-lin-x64-*"
 LIVE_LOGS = "C:\\Windows\\System32\\winevt\\Logs"
 
 # THOR Lite is distributed after registration with Nextron, so it cannot be
@@ -93,9 +102,21 @@ def default_workspace() -> str:
     """The directory the console was launched from.
 
     The tooling usually sits next to the code already; forcing an absolute path
-    would mean moving everything.
+    would mean moving everything. One exception: an executable started through
+    an elevation prompt can inherit C:\\Windows\\System32 as its working
+    directory — evidence must never land there, so the folder holding the
+    executable is used instead.
     """
-    return str(Path.cwd())
+    cwd = Path.cwd()
+    if FROZEN:
+        system_root = Path(os.environ.get("SystemRoot", r"C:\\Windows")).resolve()
+        try:
+            inside_windows = cwd.resolve() == system_root or system_root in cwd.resolve().parents
+        except OSError:
+            inside_windows = False
+        if inside_windows:
+            return str(PROJECT_DIR)
+    return str(cwd)
 
 
 def is_admin() -> bool:
@@ -111,6 +132,22 @@ def is_admin() -> bool:
         return False
 
 
+def _remote_support() -> bool:
+    try:
+        import pypsrp.client  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _image_support() -> bool:
+    try:
+        import dissect.target  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 @dataclass
 class Settings:
     workspace: str = field(default_factory=default_workspace)
@@ -119,13 +156,30 @@ class Settings:
     demo_mode: bool = not IS_WINDOWS
     virustotal_key: str = ""
     abuseipdb_key: str = ""
-    ai_provider: str = "anthropic"      # anthropic | openai | groq | mistral | openrouter | ollama | custom | none
-    ai_base_url: str = ""               # pour tout service compatible OpenAI
+    # No provider until one is chosen: defaulting to Anthropic printed "no
+    # Anthropic key configured" on every report of someone who never asked
+    # for Anthropic.
+    ai_provider: str = "none"   # anthropic | openai | groq | mistral | openrouter | ollama | custom | none
+    ai_base_url: str = ""       # for any OpenAI-compatible service
     anthropic_key: str = ""
-    ai_model: str = "claude-sonnet-4-6"
-    # collector | live | custom — "live" reads winevt\Logs directly, useful when
-    # a collection is impossible or already available elsewhere.
+    # Empty = the provider's own default model. A fixed Claude model name here
+    # was sent to Groq or Mistral as-is when the provider changed.
+    ai_model: str = ""
+    # collector | remote | image | live | custom — "image" opens a disk image
+    # (E01, VMDK, VHD/VHDX, QCOW2, raw); "live" reads winevt\Logs in place;
+    # "remote" runs the collection on another Windows host over WinRM.
     logs_source: str = "collector"
+    remote_host: str = ""
+    # Empty = the current Windows session (Kerberos on a domain): nothing
+    # typed, nothing stored.
+    remote_user: str = ""
+    # Never written to config.json: kept for the session, or read from
+    # apikeys.env / the KAGE_REMOTE_PASSWORD environment variable.
+    remote_password: str = field(default="", repr=False)
+    remote_ssl: bool = False
+    image_path: str = ""
+    # Size budget for executables pulled out of an image for the YARA scan.
+    image_files_mb: int = 1024
     cylr_args: str = "-v"
     # Only the CSV suppression is imposed; --quick is deliberately absent
     # because it skips files the analyst explicitly pointed the scan at.
@@ -173,6 +227,7 @@ class Settings:
         settings.virustotal_key = os.environ.get("VT_API_KEY", settings.virustotal_key)
         settings.abuseipdb_key = os.environ.get("ABUSEIPDB_API_KEY", settings.abuseipdb_key)
         settings.anthropic_key = os.environ.get("ANTHROPIC_API_KEY", settings.anthropic_key)
+        settings.remote_password = os.environ.get("KAGE_REMOTE_PASSWORD", settings.remote_password)
         return settings
 
     def save(self) -> None:
@@ -192,6 +247,9 @@ class Settings:
         for field in from_file:
             if field.endswith("_key") and data.get(field) == from_file[field]:
                 data[field] = ""
+        # An administrator password of another machine has no business in a
+        # plain JSON file next to the executable.
+        data.pop("remote_password", None)
         CONFIG_PATH.write_text(
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -240,6 +298,14 @@ class Settings:
             "ai_base_url": self.ai_base_url,
             "ai_model": self.ai_model,
             "logs_source": self.logs_source,
+            "image_path": self.image_path,
+            "image_files_mb": self.image_files_mb,
+            "image_support": _image_support(),
+            "remote_host": self.remote_host,
+            "remote_user": self.remote_user,
+            "remote_ssl": self.remote_ssl,
+            "remote_password_set": bool(self.remote_password),
+            "remote_support": _remote_support(),
             "cylr_args": self.cylr_args,
             "thor_args": self.thor_args,
             "thor_timeout_min": self.thor_timeout_min,

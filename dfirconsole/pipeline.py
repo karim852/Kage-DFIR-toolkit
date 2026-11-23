@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -17,12 +18,15 @@ import time
 import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 
 import httpx
 
 from . import ai as ai_module
+from . import image as image_module
+from . import remote as remote_module
 from . import sysinfo as sysinfo_module
 from . import timeline as timeline_module
 from .bus import EventBus
@@ -31,6 +35,14 @@ from .config import (HAYABUSA_BIN, IS_WINDOWS, LIVE_LOGS, TOOL_SOURCES,
 from .enrich import Enricher
 
 PENDING, RUNNING, DONE, FAILED, SKIPPED = "pending", "running", "done", "failed", "skipped"
+
+
+def human_size(size: int) -> str:
+    """A small test collection is not "0 MB"."""
+    for unit, scale in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if size >= scale:
+            return f"{size / scale:.1f} {unit}" if size < 10 * scale else f"{size // scale} {unit}"
+    return f"{size} B"
 
 # Windows tools crash with NTSTATUS codes returned as unsigned integers.
 # Untranslated, the analyst reads "code 3221225477" and learns nothing.
@@ -120,6 +132,10 @@ class Case:
         self.thor: dict | None = None
         self.ai: dict | None = None
         self.logs_dir: Path | None = None
+        self.image: dict | None = None
+        self._image_target = None
+        # Remote triage: what was collected from which host, and how.
+        self.remote: dict | None = None
         self.running = False
         self.started_at: float | None = None
         self.finished_at: float | None = None
@@ -134,7 +150,7 @@ class Case:
             ("tools", "Locate the tooling", "CyLR, Hayabusa and THOR, each in its own folder", "", False, False),
             ("collect", "Collect the artefacts", "CyLR: logs, registry, prefetch, $MFT…", "", True, False),
             ("system", "Capture the system context", "Accounts, open ports, odd folders, log coverage", "", True, True),
-            ("rules", "Update the Sigma rules", "hayabusa update-rules", f".\\{HAYABUSA_BIN} update-rules", False, False),
+            ("rules", "Update the Sigma rules", "hayabusa update-rules", "hayabusa update-rules", False, False),
             ("timeline", "Build the timeline", "Sigma correlation over the collected EVTX", "hayabusa <csv|dfir>-timeline -d <logs> -o hayabusa-output.csv", False, False),
             ("analyse", "Analyse the timeline", "Statistics, alerts, indicator extraction", "", False, False),
             ("yara", "YARA scan (THOR Lite)", "Scope of your choosing — collected artefacts by default", "", True, True),
@@ -151,9 +167,51 @@ class Case:
             )
             self.order.append(step_id)
 
+    def _refresh_step_hints(self) -> None:
+        """Keep step descriptions true to the selected evidence source.
+
+        A disk image needs neither CyLR nor administrator rights, and its
+        system context comes from the registry, not from live commands —
+        the chain on the left must say so instead of describing a live run.
+        """
+        source = (self.settings.logs_source or "collector").lower()
+        collect, system, tools = self.steps["collect"], self.steps["system"], self.steps["tools"]
+        if source == "remote":
+            host = self.settings.remote_host or "no host set"
+            collect.hint = f"Remote host: {host} — CyLR pushed over WinRM, run, fetched, removed"
+            collect.admin = False
+            system.hint = f"Same commands as a live capture, run on {host}"
+            system.admin = False
+            tools.hint = "CyLR (pushed to the remote host) and Hayabusa"
+        elif source == "image":
+            name = Path(self.settings.image_path).name or "no image selected"
+            collect.hint = f"Disk image: {name} — logs, hives, executables"
+            collect.admin = False
+            system.hint = "Host, accounts, autoruns, odd folders, read from the image"
+            system.admin = False
+            tools.hint = "Hayabusa (CyLR is not needed for a disk image)"
+        elif source in ("live", "custom"):
+            collect.hint = ("Event logs read in place (winevt\\Logs)" if source == "live"
+                            else f"Event logs from {self.settings.logs_path or 'a chosen folder'}")
+            collect.admin = source == "live"
+            system.hint = "Accounts, open ports, odd folders, log coverage"
+            system.admin = True
+            tools.hint = "CyLR, Hayabusa and THOR, each in its own folder"
+        else:
+            collect.hint = "CyLR: logs, registry, prefetch, $MFT…"
+            collect.admin = True
+            system.hint = "Accounts, open ports, odd folders, log coverage"
+            system.admin = True
+            tools.hint = "CyLR, Hayabusa and THOR, each in its own folder"
+
     # -- state ------------------------------------------------------------
     def snapshot(self) -> dict:
+        self._refresh_step_hints()
         return {
+            # Last event this snapshot reflects: lets the interface discard a
+            # snapshot that arrives after newer events (an HTTP reply racing
+            # the WebSocket used to roll a finished run back to "running").
+            "seq": self.bus.seq,
             "running": self.running,
             "steps": [self.steps[s].public() for s in self.order],
             "report": self.report,
@@ -161,6 +219,8 @@ class Case:
             "thor": self.thor,
             "ai": self.ai,
             "logs_dir": str(self.logs_dir) if self.logs_dir else None,
+            "image": self.image,
+            "remote": self.remote,
             "settings": self.settings.public(),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -413,7 +473,8 @@ class Case:
                              "thor-lite"), self.settings.thor_dir)
 
     def find_hayabusa(self) -> Path | None:
-        return self._locate((HAYABUSA_BIN, "hayabusa*.exe", "hayabusa*win*"),
+        return self._locate((HAYABUSA_BIN, "hayabusa*.exe", "hayabusa*win*",
+                             "hayabusa-*-lin-*", "hayabusa-*-mac-*"),
                             self.settings.hayabusa_dir)
 
     async def _resolve_release(self, client: httpx.AsyncClient, key: str) -> tuple[str, str]:
@@ -467,6 +528,13 @@ class Case:
                     binary = moved
             except OSError:
                 pass
+        # zipfile drops Unix permission bits: on Linux the extracted binary
+        # cannot be launched until it is marked executable again.
+        if binary and not IS_WINDOWS:
+            try:
+                binary.chmod(binary.stat().st_mode | 0o111)
+            except OSError:
+                pass
         return binary
 
     async def step_tools(self) -> str:
@@ -483,11 +551,15 @@ class Case:
         found: list[str] = []
         fetched: list[str] = []
 
+        wanted = [("hayabusa", self.find_hayabusa, settings.hayabusa_dir)]
+        if (settings.logs_source or "collector").lower() in ("collector", "remote"):
+            wanted.insert(0, ("cylr", self.find_cylr, settings.cylr_dir))
+        else:
+            self.log("CyLR not needed: the evidence source is not a live collection.",
+                     step="tools")
+
         async with httpx.AsyncClient(timeout=900, follow_redirects=True) as client:
-            for key, finder, target_dir in (
-                ("cylr", self.find_cylr, settings.cylr_dir),
-                ("hayabusa", self.find_hayabusa, settings.hayabusa_dir),
-            ):
+            for key, finder, target_dir in wanted:
                 binary = finder()
                 if binary is not None:
                     self.log(f"{key} already present: {binary}", level="ok", step="tools")
@@ -556,6 +628,16 @@ class Case:
         source = (settings.logs_source or "collector").lower()
         if source in ("live", "custom"):
             return self._use_existing_logs(source)
+        if source == "image":
+            return await self._collect_from_image()
+        if source == "remote":
+            cylr = self.find_cylr()
+            if cylr is None:
+                raise StepFailure(
+                    f"CyLR.exe not found. Run the \"Locate the tooling\" step to "
+                    f"download it, or drop it into {settings.cylr_dir}: it is "
+                    "pushed from here to the remote host.")
+            return await self._collect_remote(cylr)
 
         if not is_admin():
             raise StepFailure(
@@ -618,7 +700,156 @@ class Case:
             self.log(f"CyLR returned {explain_exit(code)} — collection may be "
                      "partial.", level="warn", step="collect")
         self.steps["collect"].artifacts = [archive.name]
-        return f"{archive.stat().st_size // (1024 * 1024)} MB collected by CyLR"
+        return f"{human_size(archive.stat().st_size)} collected by CyLR"
+
+    # -- remote triage ----------------------------------------------------
+    def _remote_transport(self):
+        settings = self.settings
+        try:
+            return remote_module.open_transport(
+                settings.remote_host.strip(), settings.remote_user.strip(),
+                settings.remote_password, settings.remote_ssl)
+        except remote_module.RemoteError as exc:
+            raise StepFailure(str(exc)) from exc
+
+    async def _remote_hello(self, transport) -> dict:
+        """Who answered, and with which rights. A session without the
+        administrator token reads nothing useful: say so before pushing CyLR."""
+        code, text = await asyncio.to_thread(
+            transport.run, ["powershell", "-NoProfile", "-Command", remote_module.HELLO], 60)
+        try:
+            hello = json.loads(text.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError):
+            raise StepFailure(f"{transport.host} answered but not as expected: {text[:200]}")
+        if not hello.get("admin"):
+            raise StepFailure(
+                f"Connected to {hello.get('hostname')} but without administrator "
+                "rights. Use an account in that host's Administrators group (for a "
+                "local account, UAC remote restrictions also apply: "
+                "LocalAccountTokenFilterPolicy).")
+        return hello
+
+    async def _collect_remote(self, cylr: Path) -> str:
+        """Push CyLR, run it on the remote host, fetch and verify the archive,
+        leave nothing behind, then continue exactly like a local collection."""
+        settings = self.settings
+        settings.evidence_dir.mkdir(parents=True, exist_ok=True)
+        settings.output_dir.mkdir(parents=True, exist_ok=True)
+        transport = self._remote_transport()
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in settings.case_name)
+        workdir = f"C:\\Windows\\Temp\\Kage-{safe}"
+        archive_name = f"{settings.case_name}.zip".replace(" ", "_")
+        record: dict = {"host": settings.remote_host, "transport": "", "workdir": workdir,
+                        "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        ps = lambda script: ["powershell", "-NoProfile", "-Command", script]  # noqa: E731
+
+        try:
+            self.log(f"Connecting to {settings.remote_host or transport.host}…", step="collect")
+            hello = await self._remote_hello(transport)
+            record.update(hostname=hello.get("hostname"), os=hello.get("os"),
+                          transport=transport.label,
+                          account=settings.remote_user or "current Windows session")
+            self.log(f"Connected to {hello.get('hostname')} ({hello.get('os')}) over "
+                     f"{transport.label}, as administrator.", level="ok", step="collect")
+
+            await asyncio.to_thread(transport.run, ps(
+                f"New-Item -ItemType Directory -Force -Path {remote_module.ps_quote(workdir)} | Out-Null"), 60)
+            remote_cylr = f"{workdir}\\CyLR.exe"
+            self.log(f"Pushing {cylr.name} to {workdir}…", step="collect")
+            await asyncio.to_thread(transport.put, cylr, remote_cylr)
+            record["cylr_sha256"] = remote_module.sha256_file(cylr)
+
+            args = [remote_cylr, "-od", workdir, "-of", archive_name,
+                    "-l", f"{workdir}\\cylr.log",
+                    *[a for a in settings.cylr_args.split() if a]]
+            self.log("Collector: CyLR, running on the remote host (a few minutes, "
+                     "the output arrives when it ends)…", level="ok", step="collect")
+            code, output = await asyncio.to_thread(transport.run, args, 3600)
+            for line in output.splitlines()[-40:]:
+                if line.strip():
+                    self.log(line.rstrip(), level="out", step="collect")
+
+            remote_archive = f"{workdir}\\{archive_name}"
+            _, digest = await asyncio.to_thread(transport.run, ps(
+                f"(Get-FileHash -Algorithm SHA256 -LiteralPath "
+                f"{remote_module.ps_quote(remote_archive)}).Hash"), 600)
+            remote_hash = (digest.strip().splitlines() or [""])[-1].strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", remote_hash):
+                raise StepFailure(f"CyLR produced no archive on {hello.get('hostname')} "
+                                  f"— {explain_exit(code)}.")
+
+            local = settings.evidence_dir / archive_name
+            started = time.monotonic()
+            last = [0.0]
+
+            def progress(done: int, total: int) -> None:
+                now = time.monotonic()
+                if now - last[0] >= 5 or done == total:
+                    last[0] = now
+                    rate = done / max(now - started, 0.001) / 1024 ** 2
+                    self.log(f"Fetching {archive_name}: {human_size(done)} / "
+                             f"{human_size(total)} ({rate:.1f} MB/s)", step="collect")
+
+            await asyncio.to_thread(transport.get, remote_archive, local, progress)
+            local_hash = remote_module.sha256_file(local)
+            if local_hash != remote_hash:
+                raise StepFailure(f"Archive damaged in transit: SHA-256 {local_hash[:16]}… "
+                                  f"here, {remote_hash[:16]}… on the host. Run the step again.")
+            record.update(archive=archive_name, archive_sha256=local_hash,
+                          size=local.stat().st_size, cylr_exit=code)
+            self.log(f"Archive verified: SHA-256 {local_hash} matches the host's.",
+                     level="ok", step="collect")
+        except remote_module.RemoteError as exc:
+            raise StepFailure(str(exc)) from exc
+        finally:
+            # Leave the target as it was found, even after a failure.
+            try:
+                await asyncio.to_thread(transport.run, ps(
+                    f"Remove-Item -Recurse -Force -LiteralPath {remote_module.ps_quote(workdir)} "
+                    "-ErrorAction SilentlyContinue"), 120)
+                self.log(f"Removed {workdir} from the remote host.", step="collect")
+                record["cleaned"] = True
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"Could not remove {workdir} on the remote host: {exc}",
+                         level="warn", step="collect")
+                record["cleaned"] = False
+            transport.close()
+
+        record["ended"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        manifest = settings.output_dir / f"{settings.case_name}-remote-manifest.json"
+        manifest.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        self.remote = {**record, "manifest": manifest.name}
+
+        produced = self._unpack_collection(local)
+        self.logs_dir = self._find_logs_dir(extra=produced)
+        if self.logs_dir is None:
+            raise StepFailure(f"Archive {archive_name} unpacked but it contains no event "
+                              "logs. Try --force-native in the CyLR arguments.")
+        self.steps["collect"].artifacts = [archive_name, manifest.name]
+        return (f"{human_size(record['size'])} collected by CyLR on "
+                f"{record.get('hostname')}, verified")
+
+    async def _system_from_remote(self) -> str:
+        transport = self._remote_transport()
+        try:
+            hello = await self._remote_hello(transport)
+
+            async def run(argv: list[str], timeout: float) -> str:
+                _, text = await asyncio.to_thread(transport.run, argv, timeout)
+                return text
+
+            async def root_entries() -> list[dict]:
+                listing = remote_module.parse_listing(await run(
+                    ["powershell", "-NoProfile", "-Command", remote_module.ROOT_LISTING], 120))
+                return sysinfo_module.analyse_root_entries(listing, prefix="C:\\")
+
+            self.log(f"Reading the system context of {hello.get('hostname')} over "
+                     f"{transport.label}…", step="system")
+            return await self._capture_system(run, root_entries, "C:\\", "remote")
+        except remote_module.RemoteError as exc:
+            raise StepFailure(str(exc)) from exc
+        finally:
+            transport.close()
 
     def _unpack_collection(self, archive: Path) -> list[Path]:
         """Unpack the collection archive, flagging whatever looks wrong.
@@ -654,6 +885,74 @@ class Case:
         self.log(f"{len(members)} item(s) extracted into {target}",
                  level="ok", step="collect")
         return [target]
+
+    def _open_image(self):
+        """Open the configured image once and reuse it across steps."""
+        path = Path(self.settings.image_path.strip().strip('"')) if self.settings.image_path else None
+        if path is None or not str(path):
+            raise StepFailure("Disk image selected as the evidence source, but no image "
+                              "path is set. Fill in Settings → Disk image.")
+        if self._image_target is not None and self.image and self.image.get("path") == str(path):
+            return self._image_target, path
+        try:
+            target = image_module.open_image(path)
+        except image_module.ImageError as exc:
+            raise StepFailure(str(exc)) from exc
+        self._image_target = target
+        return target, path
+
+    async def _collect_from_image(self) -> str:
+        """Dead-disk triage: extract what the chain needs from a disk image.
+
+        No CyLR, no elevation: the image is opened read-only and the event
+        logs, registry hives, prefetch and executable content are copied into
+        evidence\\<case>\\image, each with its SHA-256 in a manifest.
+        """
+        settings = self.settings
+        loop = asyncio.get_running_loop()
+
+        def progress(message: str, level: str = "info") -> None:
+            loop.call_soon_threadsafe(self.log, message, level, "collect")
+
+        self.log(f"Opening {settings.image_path} …", step="collect")
+        target, path = await asyncio.to_thread(self._open_image)
+        fingerprint = await asyncio.to_thread(image_module.image_fingerprint, path)
+        host = await asyncio.to_thread(image_module.describe_host, target, path)
+        self.log(f"{fingerprint['format']} · {fingerprint['size'] / 1024 ** 3:.2f} GB · "
+                 f"Windows found: {host.get('os_name') or 'unknown edition'} "
+                 f"on {host.get('hostname') or 'an unnamed host'}", level="ok", step="collect")
+
+        # Folders flagged at the disk root get their executables extracted
+        # too: C:\\Tools is exactly where an intruder leaves things.
+        listing = await asyncio.to_thread(image_module.root_listing, target)
+        flagged = [e["name"] for e in sysinfo_module.analyse_root_entries(listing)
+                   if e["kind"] == "folder"]
+
+        destination = settings.evidence_dir / settings.case_name / "image"
+        if destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
+        result = await asyncio.to_thread(
+            image_module.extract, target, destination, settings.image_files_mb,
+            flagged, progress,
+        )
+        if not result["counts"]["logs"]:
+            raise StepFailure(
+                f"No event log found in {path.name} under "
+                "Windows\\System32\\winevt\\Logs. The timeline cannot be built.")
+
+        manifest = image_module.write_manifest(
+            result, fingerprint, host,
+            settings.output_dir / f"{settings.case_name}-image-manifest.json",
+        )
+        self.logs_dir = destination / "Logs"
+        self.image = {**fingerprint, "host": host, "counts": result["counts"],
+                      "extracted_to": str(destination), "manifest": manifest.name}
+        self.log(f"Manifest with {len(result['manifest'])} SHA-256 hashes: {manifest}",
+                 level="ok", step="collect")
+        self.steps["collect"].artifacts = [manifest.name]
+        counts = result["counts"]
+        return (f"{counts['logs']} logs · {counts['hives']} hives · "
+                f"{counts['files']} executables from {path.name}")
 
     def _use_existing_logs(self, source: str) -> str:
         """Bypass the collector and work on logs that are already reachable.
@@ -740,37 +1039,55 @@ class Case:
             self.system = demo_system()
             return self._system_summary()
 
-        if not IS_WINDOWS:
-            raise StepFailure("System capture is Windows-only.")
+        if (settings.logs_source or "").lower() == "image":
+            return await self._system_from_image()
 
-        context: dict = {"collected_at": time.time()}
+        if (settings.logs_source or "").lower() == "remote":
+            return await self._system_from_remote()
+
+        if not IS_WINDOWS:
+            raise StepFailure("Live system capture needs Windows. To analyse a "
+                              "host from Linux, use a disk image as the evidence source.")
+
+        async def run(argv: list[str], timeout: float) -> str:
+            return await self.probe(argv, cwd=settings.root, timeout=timeout)
+
+        drive = Path(settings.root.anchor or "C:\\")
+        return await self._capture_system(
+            run, lambda: sysinfo_module.analyse_root(drive), str(drive), "live")
+
+    async def _capture_system(self, run, root_entries, root_path: str, source: str) -> str:
+        """The live capture, whatever runs the commands: this machine, or a
+        remote host over WinRM. Same commands, same parsers, same findings."""
+        context: dict = {"collected_at": time.time(), "source": source}
 
         # -- machine identity
         self.log("Reading the configuration…", step="system")
-        raw = await self.probe(["systeminfo"], cwd=settings.root, timeout=180)
+        raw = await run(["systeminfo"], 180)
         context["host"] = sysinfo_module.parse_systeminfo(raw)
+        # systeminfo prints dates in the host's local time and locale
+        # ("1/1/2025, 12:00:00 AM" or "01/01/2025, 00:00:00"); the console and
+        # the report work in UTC. One CIM query gives exact instants, plus the
+        # release name and time zone the disk-image path already shows.
+        context["host"].update(sysinfo_module.parse_osinfo(await run(
+            ["powershell", "-NoProfile", "-Command", sysinfo_module.OSINFO_SCRIPT], 120)))
 
         # -- local accounts and administrators
         self.log("Enumerating accounts…", step="system")
-        users_json = await self.probe(
+        users_json = await run(
             ["powershell", "-NoProfile", "-Command",
              "Get-LocalUser | Select-Object Name,Enabled,SID,LastLogon,"
-             "PasswordLastSet,Description | ConvertTo-Json -Compress"],
-            cwd=settings.root, timeout=120,
-        )
-        admins_json = await self.probe(
+             "PasswordLastSet,Description | ConvertTo-Json -Compress"], 120)
+        admins_json = await run(
             ["powershell", "-NoProfile", "-Command",
              "Get-LocalGroupMember -Group (Get-LocalGroup -SID "
-             "'S-1-5-32-544').Name | Select-Object Name | ConvertTo-Json -Compress"],
-            cwd=settings.root, timeout=120,
-        )
+             "'S-1-5-32-544').Name | Select-Object Name | ConvertTo-Json -Compress"], 120)
         context["users"] = sysinfo_module.parse_users(users_json, admins_json)
 
         # -- sockets, matched to their owning process
         self.log("Reading connections and listening ports…", step="system")
-        tasks = await self.probe(["tasklist", "/fo", "csv", "/nh"],
-                                 cwd=settings.root, timeout=120)
-        netstat = await self.probe(["netstat", "-ano"], cwd=settings.root, timeout=180)
+        tasks = await run(["tasklist", "/fo", "csv", "/nh"], 120)
+        netstat = await run(["netstat", "-ano"], 180)
         context["connections"] = sysinfo_module.parse_netstat(
             netstat, sysinfo_module.parse_tasklist(tasks)
         )
@@ -778,22 +1095,19 @@ class Case:
 
         # -- root of the system drive
         self.log("Inspecting the disk root…", step="system")
-        drive = Path(settings.root.anchor or "C:\\")
-        context["root_entries"] = sysinfo_module.analyse_root(drive)
-        context["root_path"] = str(drive)
+        context["root_entries"] = await root_entries() if asyncio.iscoroutinefunction(
+            root_entries) else root_entries()
+        context["root_path"] = root_path
 
         # -- logging: what the machine was able to see
         self.log("Auditing the logging configuration…", step="system")
         noms = ",".join(f"'{c[0]}'" for c in sysinfo_module.IMPORTANT_CHANNELS)
-        channels_json = await self.probe(
+        channels_json = await run(
             ["powershell", "-NoProfile", "-Command",
              f"Get-WinEvent -ListLog {noms} -ErrorAction SilentlyContinue | "
              "Select-Object LogName,IsEnabled,RecordCount,FileSize,"
-             "MaximumSizeInBytes,LastWriteTime | ConvertTo-Json -Compress"],
-            cwd=settings.root, timeout=180,
-        )
-        auditpol = await self.probe(["auditpol", "/get", "/category:*", "/r"],
-                                    cwd=settings.root, timeout=120)
+             "MaximumSizeInBytes,LastWriteTime | ConvertTo-Json -Compress"], 180)
+        auditpol = await run(["auditpol", "/get", "/category:*", "/r"], 120)
         context["coverage"] = sysinfo_module.audit_coverage(
             sysinfo_module.parse_channels(channels_json),
             sysinfo_module.evtx_inventory(self.logs_dir),
@@ -801,6 +1115,68 @@ class Case:
         )
 
         context["findings"] = sysinfo_module.system_findings(context)
+        self.system = context
+        self.bus.emit("system", system=context)
+        return self._system_summary()
+
+    async def _system_from_image(self) -> str:
+        """Rebuild the system context from the registry of a disk image.
+
+        What a dead disk can tell: identity, accounts, what starts on its own,
+        what sits at the disk root, which logs existed. What it cannot: open
+        sockets and running processes — the network card says so instead of
+        reporting a reassuring zero.
+        """
+        target, path = await asyncio.to_thread(self._open_image)
+        self.log("Reading identity, accounts and autoruns from the image registry…",
+                 step="system")
+        host = await asyncio.to_thread(image_module.describe_host, target, path)
+        users = await asyncio.to_thread(image_module.read_accounts, target)
+        autoruns = await asyncio.to_thread(image_module.read_autoruns, target)
+        listing = await asyncio.to_thread(image_module.root_listing, target)
+
+        # Ages are measured against the last log write, not today: an image
+        # acquired months ago would otherwise show nothing as recent.
+        inventory = sysinfo_module.evtx_inventory(self.logs_dir)
+        reference = None
+        if self.logs_dir and self.logs_dir.exists():
+            stamps = [p.stat().st_mtime for p in self.logs_dir.glob("*.evtx")]
+            manifest = (self.image or {}).get("manifest")
+            if manifest:
+                try:
+                    data = json.loads((self.settings.output_dir / manifest).read_text())
+                    stamps = [datetime.fromisoformat(f["modified"]).timestamp()
+                              for f in data.get("files", [])
+                              if f.get("category") == "event log" and f.get("modified")] or stamps
+                except (OSError, ValueError, KeyError):
+                    pass
+            reference = max(stamps) if stamps else None
+
+        context: dict = {
+            "collected_at": time.time(),
+            "source": "image",
+            "image": path.name,
+            "host": host,
+            "users": users,
+            "connections": [],
+            "network": {"available": False, "listening": 0, "established": 0, "flagged": 0,
+                        "note": "Not recoverable from a disk image: sockets only exist "
+                                "on a running system."},
+            "root_entries": sysinfo_module.analyse_root_entries(listing, reference=reference),
+            "root_path": "C:\\",
+            "autoruns": autoruns,
+            "coverage": sysinfo_module.audit_coverage({}, inventory, {}),
+        }
+        context["findings"] = sysinfo_module.system_findings(context)
+        for entry in autoruns:
+            if entry["risk"] in ("high", "medium"):
+                context["findings"].append({
+                    "level": entry["risk"],
+                    "title": f"{entry['kind'].capitalize()} persistence: {entry['name']}",
+                    "detail": f"{entry['command']} — {', '.join(entry['flags'])}",
+                })
+        order = {"high": 0, "medium": 1, "low": 2}
+        context["findings"].sort(key=lambda f: order.get(f["level"], 3))
         self.system = context
         self.bus.emit("system", system=context)
         return self._system_summary()
@@ -814,9 +1190,17 @@ class Case:
 
         self.log(f"{len(users)} local account(s), {admins} of them administrators.",
                  level="ok", step="system")
-        self.log(f"{network.get('listening', 0)} listening port(s), "
-                 f"{network.get('established', 0)} established connection(s), "
-                 f"{network.get('flagged', 0)} flagged.", level="ok", step="system")
+        if network.get("available", True):
+            self.log(f"{network.get('listening', 0)} listening port(s), "
+                     f"{network.get('established', 0)} established connection(s), "
+                     f"{network.get('flagged', 0)} flagged.", level="ok", step="system")
+        else:
+            self.log("Network state: not available from a disk image.", step="system")
+        autoruns = context.get("autoruns") or []
+        if autoruns:
+            risky = [a for a in autoruns if a["risk"] != "normal"]
+            self.log(f"{len(autoruns)} autorun(s) read from the registry, "
+                     f"{len(risky)} flagged.", level="warn" if risky else "ok", step="system")
         if roots:
             self.log(f"{len(roots)} unusual entry(ies) at the disk root.",
                      level="warn", step="system")
@@ -835,6 +1219,9 @@ class Case:
                      step="system")
         coverage_score = (context.get("coverage") or {}).get("score")
         suffix = f" · coverage {coverage_score}/100" if coverage_score is not None else ""
+        if not network.get("available", True):
+            return (f"{len(users)} accounts · {len(autoruns)} autoruns · "
+                    f"{len(roots)} root anomalies{suffix}")
         return (f"{len(users)} accounts · {network.get('listening', 0)} ports · "
                 f"{len(roots)} root anomalies{suffix}")
 
@@ -845,7 +1232,7 @@ class Case:
             return "Rules simulated"
         hayabusa = self.find_hayabusa()
         if hayabusa is None:
-            raise StepFailure(f"{HAYABUSA_BIN} not found under {self.settings.root}.")
+            raise StepFailure(f"Hayabusa not found under {self.settings.tools_dir}. Run the \"Locate the tooling\" step.")
         code, _ = await self.run_command([str(hayabusa), "update-rules"],
                                          cwd=self.settings.tools_dir, step_id="rules", timeout=900)
         if code != 0:
@@ -901,6 +1288,14 @@ class Case:
         return "csv-timeline", ""
 
     @staticmethod
+    def _spelling(flag: str, help_text: str) -> str | None:
+        """The flag as this version writes it in its help, whatever the case."""
+        if not help_text:
+            return flag
+        match = re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_text, re.I)
+        return match.group(0) if match else None
+
+    @staticmethod
     def _supported(flag: str, help_text: str) -> bool:
         """A flag missing from the help text would fail the whole command."""
         return not help_text or flag in help_text
@@ -916,7 +1311,7 @@ class Case:
 
         hayabusa = self.find_hayabusa()
         if hayabusa is None:
-            raise StepFailure(f"{HAYABUSA_BIN} not found under {settings.root}.")
+            raise StepFailure(f"Hayabusa not found under {settings.tools_dir}. Run the \"Locate the tooling\" step.")
         logs = self.logs_dir or self._find_logs_dir()
         if not logs:
             raise StepFailure("No log directory: run the collection first.")
@@ -928,12 +1323,20 @@ class Case:
 
         args = [str(hayabusa), subcommand, "-d", str(logs),
                 "-o", str(settings.timeline_csv)]
-        for flag in ("--no-wizard", "--RFC-3339", "--UTC"):
-            if self._supported(flag, sub_help):
-                args.append(flag)
+        # Hayabusa 3+ spells these in lower case (--rfc-3339, --utc). Matching
+        # "--RFC-3339" and "--UTC" exactly meant both were silently dropped,
+        # and the timeline came out in the analyst's local time.
+        for flag in ("--no-wizard", "--rfc-3339", "--utc"):
+            spelled = self._spelling(flag, sub_help)
+            if spelled:
+                args.append(spelled)
             else:
                 self.log(f"Option {flag} absent from this version — skipped.",
                          step="timeline", ui=False)
+        # The verbose profile carries each rule's ATT&CK tactics (the kill
+        # chain axis) and the log file every detection came from.
+        if self._supported("--profile", sub_help):
+            args += ["--profile", "verbose"]
 
         rules = self._find_rules_dir()
         if rules and self._supported("-r", sub_help):
@@ -1006,15 +1409,17 @@ class Case:
             "malicious": len([i for i in iocs if i.get("threat") == "malicious"]),
             "suspicious": len([i for i in iocs if i.get("threat") == "suspicious"]),
             "yara_alerts": len((self.thor or {}).get("alerts", [])),
-            "live_connections": len(
-                ((self.system or {}).get("network") or {}).get("public_peers", [])
-            ),
+            # Only connections already judged suspicious corroborate anything:
+            # a browser talking to Google used to add 4 points to every case.
+            "live_connections": len(sysinfo_module.suspicious_peers(
+                (self.system or {}).get("connections", []))),
             "coverage": ((self.system or {}).get("coverage") or {}).get("score"),
         }
 
         report = timeline_module.TimelineReport()
         report.levels = Counter(self.report.get("levels", {}))
         report.tactics = Counter(dict(self.report.get("tactics", [])))
+        report.distinct_rules = self.report.get("distinct_rules")
         breakdown = report.score_breakdown(external)
 
         self.report["risk_score"] = breakdown["score"]
@@ -1074,9 +1479,11 @@ class Case:
             added += 1
             self.report["iocs"].append({
                 "type": "ip", "value": peer, "count": 1,
-                "max_level": "high" if connection["risk"] == "high" else "medium",
-                "rules": [f"connexion active — {connection.get('process') or 'PID ' + str(connection['pid'])}"],
-                "enrichment": None, "source": "connexion active",
+                # Still worth a reputation check, but a connection nothing
+                # flagged is not raised to "medium" any more.
+                "max_level": {"high": "high", "medium": "medium"}.get(connection["risk"], "low"),
+                "rules": [f"active connection — {connection.get('process') or 'PID ' + str(connection['pid'])}"],
+                "enrichment": None, "source": "active connection",
             })
         if added:
             self.log(f"{added} address(es) from active connections added to the "
@@ -1199,6 +1606,10 @@ class Case:
         """Scan scope: the one requested, otherwise the collected artefacts."""
         if self.settings.yara_path.strip():
             return Path(self.settings.yara_path.strip())
+        # From a disk image, scan what was extracted from it — not every
+        # collection that ever landed in evidence\.
+        if self.image and Path(self.image.get("extracted_to", "")).exists():
+            return Path(self.image["extracted_to"])
         return self.settings.evidence_dir
 
     async def step_enrich(self) -> str:
@@ -1240,9 +1651,14 @@ class Case:
         spec = PROVIDERS.get((settings.ai_provider or "").lower())
         target = settings.ai_base_url.strip() or (spec or {}).get("base_url") or \
             "https://api.anthropic.com"
-        self.log(f"Provider: {(spec or {}).get('label', settings.ai_provider)} "
-                 f"→ {target}", step="ai")
-        self.log("Sending the summary to the model…", step="ai")
+        if spec is not None and spec["dialect"] == "local":
+            # Nothing leaves the machine: say so instead of naming an API.
+            self.log("Provider: none — summary written locally, nothing is sent.",
+                     step="ai")
+        else:
+            self.log(f"Provider: {(spec or {}).get('label', settings.ai_provider)} "
+                     f"→ {target}", step="ai")
+            self.log("Sending the summary to the model…", step="ai")
         self.ai = await ai_module.analyse(
             self.report,
             api_key=settings.anthropic_key,
@@ -1379,6 +1795,10 @@ class Case:
             step.artifacts = []
         self.report = self.thor = self.ai = self.system = None
         self.logs_dir = None
+        self.image = None
+        self._image_target = None
+        self.remote = None
+        self.started_at = self.finished_at = None
         self.bus.clear_history()
 
 

@@ -1,0 +1,35 @@
+# --- Secrets: never commit these -------------------------------------------
+# The tracked template is apikeys.env.example; anything else holding real
+# values stays local. Patterns are deliberately wide — a .bak or a .local
+# copy leaks just as badly as the original.
+apikeys.env
+apikeys.env.*
+!apikeys.env.example
+.env
+.env.*
+*.key
+*.pem
+config.json
+
+# --- Tool licences ----------------------------------------------------------
+# THOR Lite licences are tied to a registration and are not redistributable.
+*.lic
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# --- Working folders: keep the skeleton, ignore the contents ---------------
+tools/*/*
+!tools/*/README.md
+evidence/*
+!evidence/README.md
+output/*
+!output/README.md
+
+# --- Screenshots used by the README are tracked ----------------------------
+!docs/

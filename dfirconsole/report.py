@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html
 from datetime import datetime
+from pathlib import Path
 
 LEVEL_LABEL = {"critical": "Critical", "high": "High", "medium": "Medium",
                "low": "Low", "informational": "Info"}
@@ -55,7 +56,7 @@ h1, h2, h3, .num, .eyebrow, th, dt { font-family: "Archivo", "Arial Narrow", sys
   font-family: "Archivo", sans-serif; font-size: 8pt; font-weight: 800;
   letter-spacing: .14em; text-transform: uppercase; white-space: nowrap;
 }
-.meta { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 16px;
+.meta { display: grid; grid-template-columns: repeat(5, 1fr); margin-top: 16px;
         border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .meta div { padding: 9px 12px 9px 0; border-right: 1px solid var(--line-soft); }
 .meta div:last-child { border-right: none; }
@@ -277,11 +278,12 @@ def _system_html(system: dict | None) -> str:
 
     host = system.get("host", {})
     rows = "".join(
-        f"<tr><td>{_esc(label)}</td><td class='v'>{_esc(host.get(key, '—'))}</td></tr>"
+        f"<tr><td>{_esc(label)}</td><td class='v'>{_esc(_utc(host.get(key, '—')))}</td></tr>"
         for key, label in (
             ("hostname", "Machine name"), ("os_name", "Operating system"),
             ("os_version", "Version"), ("domain", "Domain"),
             ("logon_server", "Domain controller"), ("model", "Hardware"),
+            ("timezone", "Time zone"),
             ("install_date", "Installed on"), ("boot_time", "Booted on"),
             ("hotfix_count", "Hotfixes installed"),
         ) if host.get(key)
@@ -338,9 +340,31 @@ def _system_html(system: dict | None) -> str:
     ) if roots else '<p class="none">Nothing unusual at the root.</p>'
 
     network = system.get("network", {})
-    resume = (f"<p>{network.get('listening', 0)} listening port(s), "
-              f"{network.get('established', 0)} established connection(s), "
-              f"{network.get('flagged', 0)} flagged socket(s).</p>")
+    if network.get("available", True):
+        resume = (f"<p>{network.get('listening', 0)} listening port(s), "
+                  f"{network.get('established', 0)} established connection(s), "
+                  f"{network.get('flagged', 0)} flagged socket(s).</p>")
+    else:
+        resume = f"<p class='none'>{_esc(network.get('note') or 'Not available.')}</p>"
+        conn_table = ""
+
+    autoruns = system.get("autoruns") or []
+    autorun_html = ""
+    if autoruns:
+        autorun_rows = "".join(
+            f"<tr><td>{_esc(a['risk'] if a['risk'] != 'normal' else '—')}</td>"
+            f"<td>{_esc(a['kind'])}</td><td>{_esc(a['name'])}</td>"
+            f"<td class='v'>{_esc(a['command'])}</td>"
+            f"<td class='v'>{_esc(' · '.join(a.get('flags') or []))}</td></tr>"
+            for a in autoruns
+        )
+        autorun_html = (
+            "<h3 class='sub'>Autoruns (from the registry)</h3>"
+            "<table><colgroup><col style='width:9%'><col style='width:10%'>"
+            "<col style='width:18%'><col style='width:35%'><col></colgroup>"
+            "<thead><tr><th>Risk</th><th>Kind</th><th>Name</th><th>Command</th>"
+            f"<th>Observations</th></tr></thead><tbody>{autorun_rows}</tbody></table>"
+        )
 
     coverage = system.get("coverage") or {}
     cov_html = ""
@@ -370,16 +394,74 @@ def _system_html(system: dict | None) -> str:
             "<thead><tr><th>State</th><th>Channel</th><th>Importance</th>"
             f"<th>Events</th><th>Observations</th></tr></thead><tbody>{chan_rows}</tbody></table>"
             "<h3 class='sub'>Local audit policy</h3>"
-            "<table><colgroup><col style='width:22%'><col><col style='width:14%'>"
-            "</colgroup><thead><tr><th>State</th><th>Subcategory</th>"
-            f"<th>Importance</th></tr></thead><tbody>{audit_rows}</tbody></table>"
+            + ("<table><colgroup><col style='width:22%'><col><col style='width:14%'>"
+               "</colgroup><thead><tr><th>State</th><th>Subcategory</th>"
+               f"<th>Importance</th></tr></thead><tbody>{audit_rows}</tbody></table>"
+               if audit_rows else
+               "<p class='none'>Not captured — the audit policy is read with "
+               "auditpol on a live host.</p>")
         )
 
     return (identity
             + ("<h3 class='sub'>Logging &amp; audit</h3>" + cov_html if cov_html else "")
             + "<h3 class='sub'>Local accounts</h3>" + users_table
             + "<h3 class='sub'>Network</h3>" + resume + conn_table
+            + autorun_html
             + "<h3 class='sub'>Disk root</h3>" + root_table)
+
+
+# The weights the report actually uses, embedded so the printed document looks
+# like the console on any machine, offline included (~110 KB once encoded).
+REPORT_FONTS = (("Archivo", "archivo", 700), ("Archivo", "archivo", 800),
+                ("IBM Plex Mono", "ibm-plex-mono", 400),
+                ("IBM Plex Sans", "ibm-plex-sans", 400), ("IBM Plex Sans", "ibm-plex-sans", 600))
+_FONT_CSS: str | None = None
+
+
+def _font_faces() -> str:
+    global _FONT_CSS
+    if _FONT_CSS is None:
+        import base64
+
+        fonts = Path(__file__).resolve().parent / "web" / "fonts"
+        rules = []
+        for family, slug, weight in REPORT_FONTS:
+            path = fonts / f"{slug}-latin-{weight}-normal.woff2"
+            if path.exists():
+                data = base64.b64encode(path.read_bytes()).decode("ascii")
+                rules.append(f'@font-face{{font-family:"{family}";font-weight:{weight};'
+                             f'src:url(data:font/woff2;base64,{data}) format("woff2");}}')
+        _FONT_CSS = "".join(rules)
+    return _FONT_CSS
+
+
+def _utc(value: str) -> str:
+    """ISO instants as the rest of the report shows them: "2025-01-01 00:00 UTC"."""
+    text = str(value)
+    if len(text) >= 16 and text[4] == "-" and text[10] == "T":
+        return text[:16].replace("T", " ") + " UTC"
+    return text
+
+
+def _evidence_label(settings, case) -> str:
+    """Where the data came from: a reader weighs a live collection and a disk
+    image acquired last month differently."""
+    if settings.demo_mode:
+        return "Demonstration data"
+    source = (settings.logs_source or "collector").lower()
+    if source == "remote":
+        remote = getattr(case, "remote", None) or {}
+        host = remote.get("hostname") or settings.remote_host or "remote host"
+        digest = remote.get("archive_sha256")
+        return (f"Remote host · {host} over WinRM (CyLR)"
+                + (f" · archive SHA-256 {digest[:16]}…" if digest else ""))
+    if source == "image":
+        image = getattr(case, "image", None) or {}
+        name = Path(settings.image_path).name if settings.image_path else "disk image"
+        return f"Disk image · {name}" + (f" ({image['format']})" if image.get("format") else "")
+    return {"live": "Live host · logs read in place",
+            "custom": f"Log folder · {settings.logs_path}"}.get(
+        source, "Live host · CyLR collection")
 
 
 def render(settings, case) -> str:
@@ -389,15 +471,22 @@ def render(settings, case) -> str:
     score = report.get("risk_score", 0)
     severity = _severity(score)
 
-    host = (report.get("computers") or [["—"]])[0][0]
+    logged = (report.get("computers") or [["—"]])[0][0]
+    captured = ((case.system or {}).get("host") or {}).get("hostname") or ""
+    host = logged if logged != "—" else (captured or "—")
+    # Logs naming another machine than the one examined are worth a line:
+    # copied logs, a renamed host, or evidence mixed up between cases.
+    if captured and logged != "—" and logged.split(".")[0].lower() != captured.lower():
+        host = f"{captured} (logs name {logged})"
+    evidence = _evidence_label(settings, case)
     window = "—"
     if report.get("first_seen"):
         # Compact format: the date is repeated only when the window spans days.
         first, last = report["first_seen"], report.get("last_seen") or ""
-        start = f"{first[8:10]}/{first[5:7]} {first[11:16]}"
-        end = (last[11:16] if first[:10] == last[:10]
-               else f"{last[8:10]}/{last[5:7]} {last[11:16]}")
-        window = f"{start} → {end}"
+        # Same format as the console: year included, UTC stated.
+        start = f"{first[:10]} {first[11:16]}"
+        end = last[11:16] if first[:10] == last[:10] else f"{last[:10]} {last[11:16]}"
+        window = f"{start} → {end} UTC"
 
     # The score is never published without its components: a reader must be
     # able to challenge a single axis rather than the number as a whole.
@@ -446,9 +535,9 @@ def render(settings, case) -> str:
     scanner_name = "THOR Lite" if case.thor else "not run"
 
     return f"""<!doctype html>
-<html lang="fr"><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <title>Kage · Triage report — {_esc(settings.case_name)}</title>
-<style>{CSS}</style></head><body>
+<style>{_font_faces()}{CSS}</style></head><body>
 
 <header class="head">
   <div class="head__row">
@@ -461,6 +550,7 @@ def render(settings, case) -> str:
   <dl class="meta">
     <div><dt>Analyst</dt><dd>{_esc(settings.analyst or "not specified")}</dd></div>
     <div><dt>Host examined</dt><dd>{_esc(host)}</dd></div>
+    <div><dt>Evidence</dt><dd>{_esc(evidence)}</dd></div>
     <div><dt>Window observed</dt><dd>{_esc(window)}</dd></div>
     <div><dt>Issued on</dt><dd>{datetime.now().strftime("%Y-%m-%d %H:%M")}</dd></div>
   </dl>

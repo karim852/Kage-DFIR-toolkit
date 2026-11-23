@@ -1,0 +1,4 @@
+# Development and build tools — not needed to run Kage.
+pytest>=8
+playwright>=1.45
+pyinstaller>=6.10
