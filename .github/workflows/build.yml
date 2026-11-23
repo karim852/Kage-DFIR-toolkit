@@ -1,11 +1,14 @@
 name: Build executables
 
 # A tag such as v1.6.0 builds both executables, smoke-tests them and publishes
-# a GitHub release. "Run workflow" builds them without releasing, to try a
-# change before tagging it.
+# a GitHub release. A pull request that touches the code or the build, and
+# "Run workflow", build and smoke-test them without releasing.
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths: ["dfirconsole/**", "kage.py", "kage.spec", "build_support/**",
+            "requirements*.txt", ".github/workflows/build.yml"]
   workflow_dispatch:
 
 permissions:
