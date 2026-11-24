@@ -95,11 +95,24 @@ jobs:
           rm ./*.sha256
           cat SHA256SUMS.txt
 
-      - name: Create the release
+      # Two ways to start a release, both supported:
+      # - git push of a tag: the release does not exist yet, it is created;
+      # - GitHub's "Draft a new release" form: publishing it creates the tag
+      #   and the release together, so the files are added to that release,
+      #   and the notes filled in only if the form left them empty.
+      - name: Create or complete the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release/* \
-            --title "Kage DFIR Toolkit $GITHUB_REF_NAME" \
-            --notes-file build_support/release-notes.md \
-            --verify-tag
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --clobber
+            body="$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)"
+            if [ -z "${body//[[:space:]]/}" ]; then
+              gh release edit "$GITHUB_REF_NAME" --notes-file build_support/release-notes.md
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" release/* \
+              --title "Kage DFIR Toolkit $GITHUB_REF_NAME" \
+              --notes-file build_support/release-notes.md \
+              --verify-tag
+          fi
